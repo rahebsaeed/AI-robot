@@ -1,0 +1,14 @@
+torch
+torchvision
+torchaudio
+transformers
+accelerate
+sentencepiece
+vosk
+SpeechRecognition
+opencv-python
+pyserial
+numpy
+pillow
+bitsandbytes
+optimum
