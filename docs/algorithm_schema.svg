@@ -1,0 +1,342 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="2600" viewBox="0 0 1800 2600" role="img" aria-labelledby="title desc">
+  <title id="title">Yahboom AI Navigation and Search Algorithm Schema</title>
+  <desc id="desc">Detailed architecture and algorithm flow for launch, perception bridges, AI command routing, map search, RViz, and shutdown.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7fafc; }
+      .lane { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .header { fill: #0f172a; }
+      .headerText { fill: #ffffff; font: 700 28px Arial, sans-serif; }
+      .sectionText { fill: #0f172a; font: 700 24px Arial, sans-serif; }
+      .box { fill: #ffffff; stroke: #334155; stroke-width: 2; rx: 12; }
+      .boxBlue { fill: #e0f2fe; stroke: #0369a1; stroke-width: 2; rx: 12; }
+      .boxGreen { fill: #dcfce7; stroke: #15803d; stroke-width: 2; rx: 12; }
+      .boxYellow { fill: #fef9c3; stroke: #a16207; stroke-width: 2; rx: 12; }
+      .boxRed { fill: #fee2e2; stroke: #b91c1c; stroke-width: 2; rx: 12; }
+      .boxPurple { fill: #ede9fe; stroke: #6d28d9; stroke-width: 2; rx: 12; }
+      .boxGray { fill: #f1f5f9; stroke: #475569; stroke-width: 2; rx: 12; }
+      .label { fill: #0f172a; font: 700 18px Arial, sans-serif; }
+      .text { fill: #1e293b; font: 16px Arial, sans-serif; }
+      .small { fill: #334155; font: 14px Arial, sans-serif; }
+      .mono { fill: #0f172a; font: 14px "DejaVu Sans Mono", Consolas, monospace; }
+      .arrow { stroke: #334155; stroke-width: 3; fill: none; marker-end: url(#arrowHead); }
+      .arrowBlue { stroke: #0369a1; stroke-width: 3; fill: none; marker-end: url(#arrowHeadBlue); }
+      .arrowGreen { stroke: #15803d; stroke-width: 3; fill: none; marker-end: url(#arrowHeadGreen); }
+      .arrowRed { stroke: #b91c1c; stroke-width: 3; fill: none; marker-end: url(#arrowHeadRed); }
+      .dash { stroke-dasharray: 10 8; }
+    </style>
+    <marker id="arrowHead" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowHeadBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#0369a1"/>
+    </marker>
+    <marker id="arrowHeadGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#15803d"/>
+    </marker>
+    <marker id="arrowHeadRed" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#b91c1c"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="2600"/>
+  <rect class="header" x="40" y="30" width="1720" height="90" rx="16"/>
+  <text class="headerText" x="80" y="85">Yahboom Rosmaster X3 PLUS - AI Navigation, Perception, Search, RViz, and Shutdown Algorithm</text>
+
+  <!-- Swimlane backgrounds -->
+  <rect class="lane" x="40" y="160" width="410" height="2320" rx="18"/>
+  <rect class="lane" x="480" y="160" width="410" height="2320" rx="18"/>
+  <rect class="lane" x="920" y="160" width="410" height="2320" rx="18"/>
+  <rect class="lane" x="1360" y="160" width="400" height="2320" rx="18"/>
+
+  <text class="sectionText" x="95" y="210">Launcher and ROS</text>
+  <text class="sectionText" x="535" y="210">Bridges and Perception</text>
+  <text class="sectionText" x="980" y="210">AI Command Routing</text>
+  <text class="sectionText" x="1415" y="210">Search and Operator UI</text>
+
+  <!-- Launcher column -->
+  <rect class="boxBlue" x="80" y="250" width="330" height="100"/>
+  <text class="label" x="105" y="285">Start launcher</text>
+  <text class="mono" x="105" y="313">./start_navigation.sh MAP_NAME</text>
+  <text class="small" x="105" y="336">Single entry point for the stack</text>
+
+  <rect class="box" x="80" y="390" width="330" height="125"/>
+  <text class="label" x="105" y="425">Prepare robot runtime</text>
+  <text class="text" x="105" y="455">Stop old AI and bridge processes</text>
+  <text class="text" x="105" y="480">Restart robot-init service</text>
+  <text class="text" x="105" y="505">Restart yahboom_container</text>
+
+  <rect class="box" x="80" y="555" width="330" height="125"/>
+  <text class="label" x="105" y="590">Sync Docker devices</text>
+  <text class="mono" x="105" y="620">/dev/camera_head</text>
+  <text class="mono" x="105" y="645">/dev/ydlidar /dev/myserial</text>
+  <text class="small" x="105" y="668">Creates stable hardware aliases</text>
+
+  <rect class="boxBlue" x="80" y="720" width="330" height="145"/>
+  <text class="label" x="105" y="755">Start ROS stack</text>
+  <text class="text" x="105" y="785">roscore</text>
+  <text class="text" x="105" y="810">laser_astrapro_bringup.launch</text>
+  <text class="text" x="105" y="835">yahboomcar_navigation.launch</text>
+
+  <rect class="boxPurple" x="80" y="905" width="330" height="170"/>
+  <text class="label" x="105" y="940">AMCL localization</text>
+  <text class="text" x="105" y="970">Wait for services</text>
+  <text class="mono" x="105" y="995">/global_localization</text>
+  <text class="mono" x="105" y="1020">/move_base/clear_costmaps</text>
+  <text class="text" x="105" y="1045">Spin robot for AMCL calibration</text>
+
+  <rect class="boxGreen" x="80" y="1115" width="330" height="125"/>
+  <text class="label" x="105" y="1150">Required ROS topics</text>
+  <text class="mono" x="105" y="1180">/scan</text>
+  <text class="mono" x="105" y="1205">/camera/rgb/image_raw</text>
+  <text class="small" x="105" y="1228">Search is useful only when these exist</text>
+
+  <!-- Bridges column -->
+  <rect class="boxGreen" x="520" y="250" width="330" height="135"/>
+  <text class="label" x="545" y="285">Lidar UDP bridge</text>
+  <text class="mono" x="545" y="315">/scan -> UDP 5010</text>
+  <text class="text" x="545" y="345">Sends front and minimum range</text>
+  <text class="small" x="545" y="370">Used for safety and status</text>
+
+  <rect class="boxGreen" x="520" y="425" width="330" height="135"/>
+  <text class="label" x="545" y="460">Command UDP bridge</text>
+  <text class="mono" x="545" y="490">UDP 5020 -> /cmd_vel</text>
+  <text class="text" x="545" y="520">Caps max linear/angular speed</text>
+  <text class="small" x="545" y="545">Holds command briefly, then stops</text>
+
+  <rect class="boxGreen" x="520" y="600" width="330" height="135"/>
+  <text class="label" x="545" y="635">RGB camera bridge</text>
+  <text class="mono" x="545" y="665">/camera/rgb/image_raw -> UDP 5030</text>
+  <text class="text" x="545" y="695">JPEG 320x240 frames</text>
+  <text class="small" x="545" y="720">Consumed by YOLO detector</text>
+
+  <rect class="boxGreen" x="520" y="775" width="330" height="135"/>
+  <text class="label" x="545" y="810">AMCL pose bridge</text>
+  <text class="mono" x="545" y="840">/amcl_pose -> UDP 5040</text>
+  <text class="text" x="545" y="870">Sends x, y, yaw</text>
+  <text class="small" x="545" y="895">Cached by Robot class</text>
+
+  <rect class="boxYellow" x="520" y="950" width="330" height="170"/>
+  <text class="label" x="545" y="985">Perceptions.py</text>
+  <text class="text" x="545" y="1015">Microphone and Whisper STT</text>
+  <text class="text" x="545" y="1040">YOLO object detection</text>
+  <text class="text" x="545" y="1065">Lidar distance cache</text>
+  <text class="text" x="545" y="1090">Camera frame cache</text>
+
+  <!-- AI column -->
+  <rect class="boxBlue" x="960" y="250" width="330" height="125"/>
+  <text class="label" x="985" y="285">main.py starts</text>
+  <text class="text" x="985" y="315">Brain, Perceptions, Robot</text>
+  <text class="text" x="985" y="340">MapSearchTask and FaceBridge</text>
+  <text class="small" x="985" y="362">Then enters voice loop</text>
+
+  <rect class="boxYellow" x="960" y="415" width="330" height="135"/>
+  <text class="label" x="985" y="450">Listen and classify</text>
+  <text class="text" x="985" y="480">Voice command from Whisper</text>
+  <text class="text" x="985" y="505">Check saved-place commands</text>
+  <text class="text" x="985" y="530">Check search request patterns</text>
+
+  <rect class="boxPurple" x="960" y="590" width="330" height="150"/>
+  <text class="label" x="985" y="625">Command route</text>
+  <text class="text" x="985" y="655">Search requests bypass LLM</text>
+  <text class="text" x="985" y="680">Movement uses safe action guard</text>
+  <text class="text" x="985" y="705">Conversation uses Brain model</text>
+
+  <rect class="boxBlue" x="960" y="780" width="330" height="145"/>
+  <text class="label" x="985" y="815">Robot.py navigation</text>
+  <text class="mono" x="985" y="845">goto_map(x, y, yaw)</text>
+  <text class="mono" x="985" y="870">/move_base_simple/goal</text>
+  <text class="text" x="985" y="895">Uses cached AMCL distance</text>
+
+  <rect class="boxGray" x="960" y="965" width="330" height="145"/>
+  <text class="label" x="985" y="1000">Face UI commands</text>
+  <text class="mono" x="985" y="1030">UDP 5006</text>
+  <text class="text" x="985" y="1055">Stop search</text>
+  <text class="text" x="985" y="1080">Show existing RViz or launch one</text>
+
+  <!-- Search/UI column -->
+  <rect class="boxYellow" x="1400" y="250" width="320" height="135"/>
+  <text class="label" x="1425" y="285">Search request</text>
+  <text class="text" x="1425" y="315">Example: find bottle of water</text>
+  <text class="text" x="1425" y="340">Target text is normalized</text>
+  <text class="small" x="1425" y="365">Alias maps to YOLO class bottle</text>
+
+  <rect class="boxGreen" x="1400" y="425" width="320" height="135"/>
+  <text class="label" x="1425" y="460">Immediate camera check</text>
+  <text class="text" x="1425" y="490">Force one fresh YOLO read</text>
+  <text class="text" x="1425" y="515">If visible: stop and report found</text>
+  <text class="small" x="1425" y="540">Avoids waypoint generation delay</text>
+
+  <rect class="boxBlue" x="1400" y="600" width="320" height="160"/>
+  <text class="label" x="1425" y="635">Generate waypoints</text>
+  <text class="text" x="1425" y="665">Read map YAML and PGM</text>
+  <text class="text" x="1425" y="690">Dilate occupied cells</text>
+  <text class="text" x="1425" y="715">Keep free cells with clearance</text>
+  <text class="small" x="1425" y="740">Nearest unvisited point is selected</text>
+
+  <rect class="boxPurple" x="1400" y="800" width="320" height="180"/>
+  <text class="label" x="1425" y="835">Drive-by search loop</text>
+  <text class="text" x="1425" y="865">Send move_base goal</text>
+  <text class="text" x="1425" y="890">Camera checks while robot moves</text>
+  <text class="text" x="1425" y="915">No default stop at waypoint</text>
+  <text class="text" x="1425" y="940">No default scan or rotation</text>
+  <text class="small" x="1425" y="965">Stop only on detection/cancel/end</text>
+
+  <rect class="boxGreen" x="1400" y="1020" width="320" height="150"/>
+  <text class="label" x="1425" y="1055">Target detected</text>
+  <text class="text" x="1425" y="1085">Cancel navigation</text>
+  <text class="text" x="1425" y="1110">Publish stop</text>
+  <text class="text" x="1425" y="1135">Confirm YOLO read</text>
+  <text class="small" x="1425" y="1160">Report found on face and voice</text>
+
+  <rect class="boxRed" x="1400" y="1210" width="320" height="150"/>
+  <text class="label" x="1425" y="1245">Waypoint stuck</text>
+  <text class="text" x="1425" y="1275">No distance progress</text>
+  <text class="text" x="1425" y="1300">Mark waypoint skipped</text>
+  <text class="text" x="1425" y="1325">Continue to next goal</text>
+  <text class="small" x="1425" y="1350">Rotation is optional, disabled by default</text>
+
+  <rect class="boxGray" x="1400" y="1400" width="320" height="170"/>
+  <text class="label" x="1425" y="1435">RViz button behavior</text>
+  <text class="text" x="1425" y="1465">UI sends show_rviz</text>
+  <text class="text" x="1425" y="1490">Robot checks existing RViz</text>
+  <text class="text" x="1425" y="1515">Raise existing window</text>
+  <text class="small" x="1425" y="1540">Launch only if no RViz process exists</text>
+
+  <rect class="boxRed" x="80" y="1320" width="330" height="170"/>
+  <text class="label" x="105" y="1355">CTRL+C cleanup</text>
+  <text class="text" x="105" y="1385">Stop host AI</text>
+  <text class="text" x="105" y="1410">Stop robot motion</text>
+  <text class="text" x="105" y="1435">Stop lidar motor and drivers</text>
+  <text class="text" x="105" y="1460">Save map, stop bridges and ROS</text>
+
+  <rect class="boxGray" x="520" y="1320" width="330" height="180"/>
+  <text class="label" x="545" y="1355">Important environment knobs</text>
+  <text class="mono" x="545" y="1385">AI_SEARCH_STOP_AT_WAYPOINT=0</text>
+  <text class="mono" x="545" y="1410">AI_SEARCH_ROTATE_ON_STUCK=0</text>
+  <text class="mono" x="545" y="1435">AI_SEARCH_SCAN_SECONDS=0</text>
+  <text class="mono" x="545" y="1460">AI_SEARCH_STUCK_TIMEOUT=3.0</text>
+  <text class="mono" x="545" y="1485">AI_SEARCH_APPROACH_ON_FOUND=0</text>
+
+  <rect class="boxGray" x="960" y="1320" width="330" height="180"/>
+  <text class="label" x="985" y="1355">Operator observability</text>
+  <text class="text" x="985" y="1385">AI log: /tmp/ai_companion.log</text>
+  <text class="text" x="985" y="1410">Navigation log inside Docker</text>
+  <text class="text" x="985" y="1435">Camera and lidar bridge logs</text>
+  <text class="text" x="985" y="1460">RViz map, AMCL pose, plan</text>
+
+  <!-- Connections top/mid -->
+  <path class="arrow" d="M 245 350 L 245 390"/>
+  <path class="arrow" d="M 245 515 L 245 555"/>
+  <path class="arrow" d="M 245 680 L 245 720"/>
+  <path class="arrow" d="M 245 865 L 245 905"/>
+  <path class="arrow" d="M 245 1075 L 245 1115"/>
+
+  <path class="arrowBlue" d="M 410 785 C 460 785 470 315 520 315"/>
+  <path class="arrowBlue" d="M 410 805 C 465 805 465 490 520 490"/>
+  <path class="arrowBlue" d="M 410 825 C 470 825 465 665 520 665"/>
+  <path class="arrowBlue" d="M 410 945 C 470 945 465 840 520 840"/>
+
+  <path class="arrowGreen" d="M 850 1015 C 910 1015 900 312 960 312"/>
+  <path class="arrow" d="M 1125 375 L 1125 415"/>
+  <path class="arrow" d="M 1125 550 L 1125 590"/>
+  <path class="arrow" d="M 1290 665 C 1345 665 1345 315 1400 315"/>
+  <path class="arrow" d="M 1560 385 L 1560 425"/>
+  <path class="arrow" d="M 1560 560 L 1560 600"/>
+  <path class="arrow" d="M 1560 760 L 1560 800"/>
+  <path class="arrowGreen" d="M 1400 890 C 1340 890 1350 852 1290 852"/>
+  <path class="arrowBlue" d="M 1290 852 C 1345 852 1345 890 1400 890"/>
+  <path class="arrowGreen" d="M 1560 980 L 1560 1020"/>
+  <path class="arrowRed dash" d="M 1560 980 C 1660 1020 1660 1210 1560 1210"/>
+
+  <path class="arrowRed" d="M 245 1240 L 245 1320"/>
+  <path class="arrowBlue dash" d="M 1290 1038 C 1360 1038 1330 1485 1400 1485"/>
+  <path class="arrow" d="M 1290 1055 C 1340 1055 1350 1490 1400 1490"/>
+
+  <!-- Bottom detailed sequence -->
+  <rect class="boxBlue" x="80" y="1640" width="1640" height="780"/>
+  <text class="sectionText" x="120" y="1690">Detailed Search State Machine</text>
+
+  <rect class="boxYellow" x="120" y="1730" width="260" height="105"/>
+  <text class="label" x="145" y="1765">1. Voice command</text>
+  <text class="text" x="145" y="1795">"Search for bottle"</text>
+  <text class="small" x="145" y="1820">Parsed by main.py</text>
+
+  <rect class="boxYellow" x="430" y="1730" width="260" height="105"/>
+  <text class="label" x="455" y="1765">2. Resolve target</text>
+  <text class="text" x="455" y="1795">Aliases map to YOLO</text>
+  <text class="mono" x="455" y="1820">bottle of water -> bottle</text>
+
+  <rect class="boxGreen" x="740" y="1730" width="260" height="105"/>
+  <text class="label" x="765" y="1765">3. Current view</text>
+  <text class="text" x="765" y="1795">Fresh YOLO read</text>
+  <text class="small" x="765" y="1820">Fast success path</text>
+
+  <rect class="boxBlue" x="1050" y="1730" width="260" height="105"/>
+  <text class="label" x="1075" y="1765">4. Waypoints</text>
+  <text class="text" x="1075" y="1795">Free-space map points</text>
+  <text class="small" x="1075" y="1820">Sorted by nearest pose</text>
+
+  <rect class="boxPurple" x="1360" y="1730" width="260" height="105"/>
+  <text class="label" x="1385" y="1765">5. Send goal</text>
+  <text class="mono" x="1385" y="1795">/move_base_simple/goal</text>
+  <text class="small" x="1385" y="1820">Robot starts moving</text>
+
+  <path class="arrow" d="M 380 1782 L 430 1782"/>
+  <path class="arrow" d="M 690 1782 L 740 1782"/>
+  <path class="arrow" d="M 1000 1782 L 1050 1782"/>
+  <path class="arrow" d="M 1310 1782 L 1360 1782"/>
+
+  <rect class="boxGreen" x="120" y="1900" width="300" height="130"/>
+  <text class="label" x="145" y="1935">Live camera while moving</text>
+  <text class="text" x="145" y="1965">YOLO checks cached frames</text>
+  <text class="text" x="145" y="1990">No default stop at waypoint</text>
+  <text class="small" x="145" y="2015">Detection can interrupt navigation</text>
+
+  <rect class="boxGreen" x="480" y="1900" width="300" height="130"/>
+  <text class="label" x="505" y="1935">If target visible</text>
+  <text class="text" x="505" y="1965">Cancel move_base</text>
+  <text class="text" x="505" y="1990">Stop cmd_vel</text>
+  <text class="small" x="505" y="2015">Confirm and report found</text>
+
+  <rect class="boxYellow" x="840" y="1900" width="300" height="130"/>
+  <text class="label" x="865" y="1935">If goal reached</text>
+  <text class="text" x="865" y="1965">Mark waypoint drive-by</text>
+  <text class="text" x="865" y="1990">Choose next waypoint</text>
+  <text class="small" x="865" y="2015">No stop/check by default</text>
+
+  <rect class="boxRed" x="1200" y="1900" width="300" height="130"/>
+  <text class="label" x="1225" y="1935">If stuck</text>
+  <text class="text" x="1225" y="1965">Mark waypoint skipped</text>
+  <text class="text" x="1225" y="1990">Continue to next waypoint</text>
+  <text class="small" x="1225" y="2015">No left rotation by default</text>
+
+  <path class="arrowBlue" d="M 1490 1835 C 1490 1870 270 1870 270 1900"/>
+  <path class="arrowGreen" d="M 420 1965 L 480 1965"/>
+  <path class="arrow" d="M 420 2010 C 545 2100 780 2100 990 2030"/>
+  <path class="arrowRed" d="M 420 1988 C 650 2130 1050 2130 1350 2030"/>
+  <path class="arrow" d="M 1140 1965 L 1200 1965"/>
+  <path class="arrow" d="M 1500 1965 C 1635 1965 1660 1782 1620 1782"/>
+  <path class="arrow" d="M 1140 1988 C 1320 2140 1660 2100 1620 1782"/>
+
+  <rect class="boxGray" x="120" y="2140" width="700" height="180"/>
+  <text class="label" x="145" y="2175">Default fast-search policy</text>
+  <text class="mono" x="145" y="2205">STOP_AT_WAYPOINT=0</text>
+  <text class="mono" x="145" y="2230">SCAN_SECONDS=0</text>
+  <text class="mono" x="145" y="2255">ROTATE_ON_STUCK=0</text>
+  <text class="mono" x="145" y="2280">MAX_RECOVERIES_PER_WP=0</text>
+  <text class="small" x="145" y="2305">The robot searches while navigating, not by stopping at every waypoint.</text>
+
+  <rect class="boxGray" x="900" y="2140" width="700" height="180"/>
+  <text class="label" x="925" y="2175">Optional slower inspection mode</text>
+  <text class="mono" x="925" y="2205">AI_SEARCH_STOP_AT_WAYPOINT=1</text>
+  <text class="mono" x="925" y="2230">AI_SEARCH_WAYPOINT_CHECK_SECONDS=0.75</text>
+  <text class="mono" x="925" y="2255">AI_SEARCH_SCAN_SECONDS=2.4</text>
+  <text class="small" x="925" y="2305">Use only when careful local inspection is more important than speed.</text>
+
+  <!-- Footer -->
+  <text class="small" x="80" y="2520">Files: start_navigation.sh, main.py, core/perceptions.py, core/robot.py, core/search_tasks.py, robot_face.py</text>
+  <text class="small" x="80" y="2545">Primary behavior: live YOLO detection while move_base navigates through free-space map waypoints.</text>
+</svg>
+
