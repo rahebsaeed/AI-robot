@@ -1,0 +1,7 @@
+<launch>
+    <!-- Start the Robot Face UI Node -->
+    <!-- Note: Ensure your environment has PyQt5 installed -->
+    <node name="robot_face_ui" pkg="yahboomcar_nav" type="robot_face.py" output="screen">
+        <param name="use_test_mode" value="false" />
+    </node>
+</launch>

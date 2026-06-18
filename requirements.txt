@@ -12,3 +12,6 @@ numpy
 pillow
 bitsandbytes
 optimum
+openai-whisper
+PyQt5
+ultralytics

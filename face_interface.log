@@ -1,0 +1,5 @@
+DEBUG: UDP listener thread started, binding to 127.0.0.1:5005
+DEBUG: Received raw UDP payload: happy
+DEBUG: Received raw UDP payload: msg:AI companion system is active and ready.
+DEBUG: received message: AI companion system is active and ready.
+DEBUG: showing chunk: AI companion system is active and ready.
