@@ -174,6 +174,62 @@ The host AI caches this pose for fast distance checks.
 - YOLO object detection.
 - Text-to-speech with `espeak-ng`.
 
+### Speech Recognition and Noise Handling
+
+Whisper is selected automatically after Qwen has loaded so the STT model fits
+the remaining CUDA memory. Automatic mode only considers complete models that
+are already cached, so a missing large checkpoint cannot block robot startup:
+
+1. `turbo` when at least about 7 GiB is free.
+2. `small.en` when at least about 2.7 GiB is free.
+3. `base.en` when at least about 1.3 GiB is free.
+4. `tiny.en` as the low-memory fallback.
+
+The speech pipeline keeps SpeechRecognition's dynamic energy threshold active.
+It performs an initial ambient-noise calibration, refreshes that calibration
+periodically, records mono audio, resamples to 16 kHz, and rejects clips that
+are too short or too quiet. Whisper uses deterministic beam-search decoding and
+the result is rejected when its average log probability is too low or its
+`no_speech` probability indicates noise. A short cooldown after `espeak-ng`
+prevents the robot from transcribing its own voice.
+
+Important environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AI_WHISPER_MODEL` | `auto` | Force `turbo`, `small.en`, `base.en`, or another installed official model. |
+| `AI_WHISPER_AUTO_DOWNLOAD` | `0` | Allow automatic mode to download a missing model during startup. Keep disabled for reliable launch. |
+| `AI_WHISPER_LANGUAGE` | `en` | Skip language detection and transcribe as English. |
+| `AI_WHISPER_BEAM_SIZE` | `5` | Beam width; lower values reduce latency. |
+| `AI_MIC_CALIBRATION_SECONDS` | `1.5` | Initial quiet-room calibration duration. |
+| `AI_MIC_RECALIBRATION_SECONDS` | `45` | Interval for short ambient-noise recalibration. |
+| `AI_MIC_DYNAMIC_RATIO` | `1.8` | Required energy above the estimated noise floor. |
+| `AI_MIC_ENERGY_THRESHOLD` | unset | Optional fixed threshold; disables automatic recalibration. |
+| `AI_STT_MIN_RMS` | `35` | Reject very weak captured audio before inference. |
+| `AI_STT_REJECT_NO_SPEECH` | `0.72` | Reject probable non-speech segments. |
+| `AI_STT_REJECT_LOGPROB` | `-1.15` | Reject very low-confidence transcriptions. |
+| `AI_STT_ECHO_COOLDOWN` | `0.45` | Delay listening after robot speech. |
+
+For English robot commands, `small.en` is the stable manual choice when `turbo`
+does not fit alongside Qwen and YOLO:
+
+```bash
+AI_WHISPER_MODEL=small.en ./start_navigation.sh salle_robotique
+```
+
+Download a larger model separately before using automatic mode. This avoids
+leaving the full AI application blocked while the checkpoint is transferred:
+
+```bash
+python3 -c "import whisper; whisper.load_model('small.en', device='cpu')"
+```
+
+Until that download completes, use the cached low-latency model explicitly:
+
+```bash
+AI_WHISPER_MODEL=tiny.en ./start_navigation.sh salle_robotique
+```
+
 ### Vision Data Format
 
 The `see()` method returns a frame and a structured vision dictionary:
@@ -533,4 +589,3 @@ The stable search behavior should be:
 - avoid wasting time at every waypoint,
 - keep RViz visible for operator inspection,
 - shut down hardware safely.
-

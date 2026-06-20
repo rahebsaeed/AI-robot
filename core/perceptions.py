@@ -1,7 +1,9 @@
 import os
 import sys
+import gc
 import json
 import queue
+import re
 import socket
 import struct
 import tempfile
@@ -9,6 +11,7 @@ import threading
 import time
 from contextlib import contextmanager
 from ctypes import CFUNCTYPE, c_char_p, c_int, cdll
+from urllib.parse import urlparse
 
 # Workaround: mask "coverage" to prevent numba crashes on Jetson.
 sys.modules["coverage"] = None
@@ -57,6 +60,7 @@ class Perceptions:
         self._state_lock = threading.Lock()
         self._last_stt_error_time = 0.0
         self._last_stt_error_text = ""
+        self._last_robot_speech_end = 0.0
         self.is_muted = False
         self._robot_moving = False
         self._search_target = None
@@ -122,26 +126,71 @@ class Perceptions:
             except Exception as e:
                 print(f"Failed to detect native settings: {e}. Using fallback 16000 Hz, 1 channel", flush=True)
 
-        self.channels = native_channels
+        requested_channels = self._env_int("ROBOT_MIC_CHANNELS", 1, minimum=1, maximum=2)
+        self.channels = min(requested_channels, max(1, native_channels))
 
         with _ignore_stderr():
             if target_idx is not None:
                 print(f"Selecting Microphone Index: {target_idx} ({mics[target_idx]})", flush=True)
                 self.mic = sr.Microphone(device_index=target_idx, sample_rate=native_rate)
-                self.mic.CHANNELS = native_channels
+                self.mic.CHANNELS = self.channels
             else:
                 print("No clear USB Mic found, using default.", flush=True)
                 self.mic = sr.Microphone()
 
             self.recognizer = sr.Recognizer()
             self.recognizer.dynamic_energy_threshold = True
-            with self.mic as source:
-                print("Calibrating microphone for 2 seconds... Please be quiet.", flush=True)
-                self.recognizer.adjust_for_ambient_noise(source, duration=2)
-                print(f"Calibration done. Threshold: {self.recognizer.energy_threshold:.2f}", flush=True)
+            self.recognizer.dynamic_energy_adjustment_damping = self._env_float(
+                "AI_MIC_DYNAMIC_DAMPING", 0.15, minimum=0.01, maximum=0.99
+            )
+            self.recognizer.dynamic_energy_ratio = self._env_float(
+                "AI_MIC_DYNAMIC_RATIO", 1.8, minimum=1.05, maximum=4.0
+            )
+            self.recognizer.pause_threshold = self._env_float(
+                "AI_MIC_PAUSE_SECONDS", 0.65, minimum=0.3, maximum=2.0
+            )
+            self.recognizer.phrase_threshold = self._env_float(
+                "AI_MIC_PHRASE_SECONDS", 0.25, minimum=0.1, maximum=1.0
+            )
+            self.recognizer.non_speaking_duration = min(
+                self.recognizer.pause_threshold,
+                self._env_float("AI_MIC_NON_SPEAKING_SECONDS", 0.35, minimum=0.1, maximum=1.0),
+            )
+            configured_threshold = os.environ.get("AI_MIC_ENERGY_THRESHOLD", "").strip()
+            self._manual_energy_threshold = False
+            if configured_threshold:
+                try:
+                    self.recognizer.energy_threshold = max(1.0, float(configured_threshold))
+                    self._manual_energy_threshold = True
+                except ValueError:
+                    print(f"[STT] Invalid AI_MIC_ENERGY_THRESHOLD={configured_threshold!r}; calibrating", flush=True)
 
-            print("Loading Whisper model (tiny.en)...", flush=True)
-            self.whisper_model = whisper.load_model("tiny.en")
+            self._mic_recalibration_seconds = self._env_float(
+                "AI_MIC_RECALIBRATION_SECONDS", 45.0, minimum=0.0, maximum=600.0
+            )
+            self._mic_quick_calibration_seconds = self._env_float(
+                "AI_MIC_QUICK_CALIBRATION_SECONDS", 0.45, minimum=0.1, maximum=2.0
+            )
+            initial_calibration = self._env_float(
+                "AI_MIC_CALIBRATION_SECONDS", 1.5, minimum=0.2, maximum=5.0
+            )
+            with self.mic as source:
+                if self._manual_energy_threshold:
+                    print(
+                        f"[STT] Using fixed microphone threshold: {self.recognizer.energy_threshold:.2f}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"Calibrating microphone for {initial_calibration:.1f} seconds... Please be quiet.",
+                        flush=True,
+                    )
+                    self.recognizer.adjust_for_ambient_noise(source, duration=initial_calibration)
+                    print(f"Calibration done. Threshold: {self.recognizer.energy_threshold:.2f}", flush=True)
+            self._last_mic_calibration = time.monotonic()
+
+            self._configure_stt()
+            self.whisper_model, self.whisper_model_name, self.whisper_device = self._load_whisper_model()
 
         requested_model = os.environ.get("AI_YOLO_MODEL", "").strip()
         search_paths = []
@@ -163,6 +212,185 @@ class Perceptions:
             "refrigerator": float(os.environ.get("AI_YOLO_REFRIGERATOR_CONF", "0.55")),
         }
         print("[YOLO11] Ready.", flush=True)
+
+    @staticmethod
+    def _env_float(name, default, minimum=None, maximum=None):
+        try:
+            value = float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            value = float(default)
+        if minimum is not None:
+            value = max(float(minimum), value)
+        if maximum is not None:
+            value = min(float(maximum), value)
+        return value
+
+    @staticmethod
+    def _env_int(name, default, minimum=None, maximum=None):
+        try:
+            value = int(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            value = int(default)
+        if minimum is not None:
+            value = max(int(minimum), value)
+        if maximum is not None:
+            value = min(int(maximum), value)
+        return value
+
+    def _configure_stt(self):
+        self._stt_language = os.environ.get("AI_WHISPER_LANGUAGE", "en").strip() or "en"
+        self._stt_beam_size = self._env_int("AI_WHISPER_BEAM_SIZE", 5, minimum=1, maximum=10)
+        self._stt_no_speech_threshold = self._env_float(
+            "AI_WHISPER_NO_SPEECH_THRESHOLD", 0.60, minimum=0.0, maximum=1.0
+        )
+        self._stt_logprob_threshold = self._env_float(
+            "AI_WHISPER_LOGPROB_THRESHOLD", -1.0, minimum=-5.0, maximum=0.0
+        )
+        self._stt_compression_threshold = self._env_float(
+            "AI_WHISPER_COMPRESSION_RATIO_THRESHOLD", 2.4, minimum=1.0, maximum=10.0
+        )
+        self._stt_reject_no_speech = self._env_float(
+            "AI_STT_REJECT_NO_SPEECH", 0.72, minimum=0.0, maximum=1.0
+        )
+        self._stt_reject_logprob = self._env_float(
+            "AI_STT_REJECT_LOGPROB", -1.15, minimum=-5.0, maximum=0.0
+        )
+        self._stt_min_rms = self._env_float("AI_STT_MIN_RMS", 35.0, minimum=0.0, maximum=5000.0)
+        self._stt_min_audio_seconds = self._env_float(
+            "AI_STT_MIN_AUDIO_SECONDS", 0.25, minimum=0.05, maximum=2.0
+        )
+        self._stt_echo_cooldown = self._env_float(
+            "AI_STT_ECHO_COOLDOWN", 0.45, minimum=0.0, maximum=3.0
+        )
+        self._stt_initial_prompt = os.environ.get("AI_WHISPER_INITIAL_PROMPT", "").strip()
+
+    @staticmethod
+    def _cuda_free_gib():
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+            return float(free_bytes) / (1024.0 ** 3)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _whisper_cache_root():
+        configured = os.environ.get("AI_WHISPER_CACHE", "").strip()
+        return os.path.expanduser(configured or "~/.cache/whisper")
+
+    def _whisper_cached_path(self, model_name):
+        cache_root = self._whisper_cache_root()
+        filenames = [f"{model_name}.pt"]
+        model_url = getattr(whisper, "_MODELS", {}).get(model_name, "")
+        if model_url:
+            url_filename = os.path.basename(urlparse(model_url).path)
+            if url_filename and url_filename not in filenames:
+                filenames.insert(0, url_filename)
+
+        # Reject obvious partial downloads. Official checkpoints are much
+        # larger than these conservative lower bounds.
+        lower_name = model_name.lower()
+        if lower_name.startswith("tiny"):
+            minimum_bytes = 65 * 1024**2
+        elif lower_name.startswith("base"):
+            minimum_bytes = 125 * 1024**2
+        elif lower_name.startswith("small"):
+            minimum_bytes = 420 * 1024**2
+        elif lower_name.startswith("medium"):
+            minimum_bytes = 1300 * 1024**2
+        elif "turbo" in lower_name:
+            minimum_bytes = 1400 * 1024**2
+        else:
+            minimum_bytes = 2500 * 1024**2
+
+        for filename in filenames:
+            path = os.path.join(cache_root, filename)
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) >= minimum_bytes:
+                    return path
+            except OSError:
+                continue
+        return None
+
+    def _whisper_model_candidates(self):
+        requested = os.environ.get("AI_WHISPER_MODEL", "auto").strip() or "auto"
+        if requested.lower() != "auto":
+            ordered = [requested, "small.en", "base.en", "tiny.en"]
+        elif torch.cuda.is_available():
+            free_gib = self._cuda_free_gib()
+            if free_gib >= 7.0:
+                ordered = ["turbo", "small.en", "base.en", "tiny.en"]
+            elif free_gib >= 2.7:
+                ordered = ["small.en", "base.en", "tiny.en"]
+            elif free_gib >= 1.3:
+                ordered = ["base.en", "tiny.en"]
+            else:
+                ordered = ["tiny.en"]
+            print(f"[STT] Whisper auto-selection: CUDA free={free_gib:.1f} GiB", flush=True)
+        else:
+            ordered = ["base.en", "tiny.en"]
+
+        available = set(whisper.available_models())
+        result = []
+        for name in ordered:
+            if name not in available:
+                print(f"[STT] Whisper model unavailable in installed package: {name}", flush=True)
+                continue
+            if name not in result:
+                result.append(name)
+
+        auto_download = os.environ.get("AI_WHISPER_AUTO_DOWNLOAD", "0").strip() == "1"
+        if requested.lower() == "auto" and not auto_download:
+            cached = [name for name in result if self._whisper_cached_path(name)]
+            skipped = [name for name in result if name not in cached]
+            if skipped:
+                print(
+                    f"[STT] Auto mode skipping uncached models: {', '.join(skipped)}",
+                    flush=True,
+                )
+            if cached:
+                result = cached
+            else:
+                print("[STT] No complete cached model found; using tiny.en fallback", flush=True)
+                result = ["tiny.en"]
+        if not result:
+            result = ["tiny.en"]
+        return result
+
+    def _load_whisper_model(self):
+        device_setting = os.environ.get("AI_WHISPER_DEVICE", "auto").strip().lower() or "auto"
+        device = "cuda" if device_setting == "auto" and torch.cuda.is_available() else device_setting
+        if device == "auto":
+            device = "cpu"
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            print("[STT] CUDA requested but unavailable; using CPU", flush=True)
+            device = "cpu"
+
+        errors = []
+        cache_root = self._whisper_cache_root()
+        for model_name in self._whisper_model_candidates():
+            try:
+                cached_path = self._whisper_cached_path(model_name)
+                cache_state = cached_path or "download required"
+                print(
+                    f"[STT] Loading Whisper {model_name} on {device} ({cache_state})...",
+                    flush=True,
+                )
+                model = whisper.load_model(model_name, device=device, download_root=cache_root)
+                print(
+                    f"[STT] Whisper ready: model={model_name} device={device} "
+                    f"beam={self._stt_beam_size} language={self._stt_language}",
+                    flush=True,
+                )
+                return model, model_name, device
+            except Exception as exc:
+                errors.append(f"{model_name}: {exc}")
+                print(f"[STT] Could not load {model_name}: {exc}", flush=True)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        raise RuntimeError("No Whisper model could be loaded. " + " | ".join(errors))
 
     def _start_lidar_listener(self):
         def _listen():
@@ -243,18 +471,80 @@ class Perceptions:
         self._search_target = target
         self._search_target_open_vocab = bool(open_vocab)
 
+    @staticmethod
+    def _audio_metrics(audio_data):
+        raw = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
+        samples = np.frombuffer(raw, dtype=np.int16)
+        if samples.size == 0:
+            return 0.0, 0.0, 0
+        samples_float = samples.astype(np.float32)
+        rms = float(np.sqrt(np.mean(samples_float * samples_float)))
+        peak = int(np.max(np.abs(samples_float)))
+        duration = float(samples.size) / 16000.0
+        return duration, rms, peak
+
+    def _transcription_quality(self, result):
+        segments = result.get("segments", []) if isinstance(result, dict) else []
+        if not segments:
+            return None, None, True
+
+        weights = []
+        no_speech_values = []
+        logprob_values = []
+        for segment in segments:
+            try:
+                duration = max(0.05, float(segment.get("end", 0.0)) - float(segment.get("start", 0.0)))
+                no_speech = float(segment.get("no_speech_prob", 0.0))
+                avg_logprob = float(segment.get("avg_logprob", 0.0))
+            except (TypeError, ValueError):
+                continue
+            weights.append(duration)
+            no_speech_values.append(no_speech)
+            logprob_values.append(avg_logprob)
+
+        if not weights:
+            return None, None, True
+        total = sum(weights)
+        mean_no_speech = sum(v * w for v, w in zip(no_speech_values, weights)) / total
+        mean_logprob = sum(v * w for v, w in zip(logprob_values, weights)) / total
+        reject = (
+            mean_logprob < self._stt_reject_logprob
+            or (
+                mean_no_speech >= self._stt_reject_no_speech
+                and mean_logprob < -0.55
+            )
+        )
+        return mean_no_speech, mean_logprob, reject
+
+    def _wait_for_speaker_echo(self):
+        remaining = self._stt_echo_cooldown - (time.monotonic() - self._last_robot_speech_end)
+        if remaining > 0.0:
+            time.sleep(remaining)
+
     def listen(self, timeout=5, phrase_time_limit=8):
         if self.is_muted:
             time.sleep(0.5)
             return None
+
+        self._wait_for_speaker_echo()
 
         import speech_recognition as sr_lib
 
         with _ignore_stderr():
             try:
                 with self.mic as source:
-                    self.recognizer.dynamic_energy_threshold = False
-                    self.recognizer.energy_threshold = max(50, self.recognizer.energy_threshold * 0.5)
+                    calibration_due = (
+                        not self._manual_energy_threshold
+                        and self._mic_recalibration_seconds > 0.0
+                        and time.monotonic() - self._last_mic_calibration >= self._mic_recalibration_seconds
+                    )
+                    if calibration_due and not self._robot_moving:
+                        print("[STT] Refreshing ambient-noise calibration...", flush=True)
+                        self.recognizer.adjust_for_ambient_noise(
+                            source, duration=self._mic_quick_calibration_seconds
+                        )
+                        self._last_mic_calibration = time.monotonic()
+                    self.recognizer.dynamic_energy_threshold = True
                     print(f"\n[LISTENING] (threshold={self.recognizer.energy_threshold:.1f})...", flush=True)
                     audio_data = self.recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
             except sr_lib.WaitTimeoutError:
@@ -267,21 +557,54 @@ class Perceptions:
             return None
 
         try:
-            print("[VOICE] Got audio, transcribing...", flush=True)
-            wav_data = audio_data.get_wav_data()
+            duration, rms, peak = self._audio_metrics(audio_data)
+            print(
+                f"[VOICE] Got audio: duration={duration:.2f}s rms={rms:.0f} peak={peak}; transcribing...",
+                flush=True,
+            )
+            if duration < self._stt_min_audio_seconds or rms < self._stt_min_rms:
+                print("[STT] Rejected audio before Whisper: too short or too quiet", flush=True)
+                return None
+
+            wav_data = audio_data.get_wav_data(convert_rate=16000, convert_width=2)
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
                 tmp_path = tmp_file.name
                 tmp_file.write(wav_data)
             try:
-                result = self.whisper_model.transcribe(tmp_path, fp16=torch.cuda.is_available(), language="en")
+                transcribe_options = {
+                    "task": "transcribe",
+                    "language": self._stt_language,
+                    "fp16": self.whisper_device.startswith("cuda"),
+                    "temperature": 0.0,
+                    "beam_size": self._stt_beam_size,
+                    "patience": 1.0,
+                    "condition_on_previous_text": False,
+                    "no_speech_threshold": self._stt_no_speech_threshold,
+                    "logprob_threshold": self._stt_logprob_threshold,
+                    "compression_ratio_threshold": self._stt_compression_threshold,
+                    "word_timestamps": False,
+                    "verbose": False,
+                }
+                if self._stt_initial_prompt:
+                    transcribe_options["initial_prompt"] = self._stt_initial_prompt
+                result = self.whisper_model.transcribe(tmp_path, **transcribe_options)
                 text = str(result.get("text", "")).strip()
             finally:
                 try:
                     os.unlink(tmp_path)
                 except Exception:
                     pass
-            if len(text) > 2:
-                print(f"[HEARD] \"{text}\"", flush=True)
+            no_speech, avg_logprob, reject = self._transcription_quality(result)
+            quality_text = (
+                f"no_speech={no_speech:.2f} avg_logprob={avg_logprob:.2f}"
+                if no_speech is not None and avg_logprob is not None
+                else "quality=unavailable"
+            )
+            if reject:
+                print(f"[STT] Rejected low-confidence transcription: {quality_text} text={text!r}", flush=True)
+                return None
+            if len(text) > 2 and re.search(r"[A-Za-z0-9]", text):
+                print(f"[HEARD] \"{text}\" ({quality_text}, model={self.whisper_model_name})", flush=True)
                 return text
             return None
         except Exception as e:
@@ -452,3 +775,5 @@ class Perceptions:
             os.system(cmd)
         except Exception as e:
             print(f"Speaker Error: {e}", flush=True)
+        finally:
+            self._last_robot_speech_end = time.monotonic()

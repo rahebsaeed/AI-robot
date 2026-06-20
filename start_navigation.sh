@@ -596,6 +596,16 @@ start_ai() {
     export HF_HUB_OFFLINE=1
     export PYTHONUNBUFFERED=1
     export AI_MAP_NAME="$MAP_NAME"
+    # Whisper chooses the most accurate model that fits the CUDA memory left
+    # after Qwen has loaded: turbo -> small.en -> base.en -> tiny.en.
+    export AI_WHISPER_MODEL="${AI_WHISPER_MODEL:-auto}"
+    export AI_WHISPER_AUTO_DOWNLOAD="${AI_WHISPER_AUTO_DOWNLOAD:-0}"
+    export AI_WHISPER_LANGUAGE="${AI_WHISPER_LANGUAGE:-en}"
+    export AI_WHISPER_BEAM_SIZE="${AI_WHISPER_BEAM_SIZE:-5}"
+    export AI_MIC_CALIBRATION_SECONDS="${AI_MIC_CALIBRATION_SECONDS:-1.5}"
+    export AI_MIC_RECALIBRATION_SECONDS="${AI_MIC_RECALIBRATION_SECONDS:-45}"
+    export AI_MIC_DYNAMIC_RATIO="${AI_MIC_DYNAMIC_RATIO:-1.8}"
+    export AI_STT_ECHO_COOLDOWN="${AI_STT_ECHO_COOLDOWN:-0.45}"
     export AI_YOLO_MODEL="${AI_YOLO_MODEL:-$AI_FOLDER/yolo11n.pt}"
     export AI_OPEN_VOCAB="${AI_OPEN_VOCAB:-0}"
     export AI_OPEN_VOCAB_BACKEND="${AI_OPEN_VOCAB_BACKEND:-disabled}"
