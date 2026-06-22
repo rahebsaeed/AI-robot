@@ -19,6 +19,9 @@ from core.search_tasks import (
 )
 from core.face_bridge import FaceBridge
 from core.places_memory import PlacesMemory
+from core.command_bus import CommandBus, MicrophoneCommandProducer
+from core.mobile_control import MobileTeleopController
+from core.mobile_gateway import MobileGateway
 
 OBSTACLE_STOP_DISTANCE = 0.45
 OBSTACLE_SLOW_DISTANCE = 0.80
@@ -168,13 +171,32 @@ def face_show_search_status(face: FaceBridge, status: dict):
     face.send_status(status)
 
 
+def deliver_response(perceptions, face, mobile_gateway, envelope,
+                     user_text: str, speech: str, face_message: bool = True,
+                     status: str = "completed", **extra):
+    """Deliver one final response consistently to robot audio, face, and Android."""
+    if face_message:
+        face.send_message(f"You: {user_text}\nAI: {speech}")
+    perceptions.speak(speech)
+    if mobile_gateway is not None:
+        mobile_gateway.publish_response(
+            envelope.request_id,
+            speech,
+            envelope.source,
+            status=status,
+            **extra,
+        )
+
+
 class UiCommandListener:
     def __init__(self, robot: Robot, search_task: MapSearchTask,
-                 face: FaceBridge, perceptions: Perceptions, host="127.0.0.1", port=5006):
+                 face: FaceBridge, perceptions: Perceptions,
+                 stop_search_callback=None, host="127.0.0.1", port=5006):
         self.robot = robot
         self.search_task = search_task
         self.face = face
         self.perceptions = perceptions
+        self.stop_search_callback = stop_search_callback
         self.host = host
         self.port = port
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -210,6 +232,9 @@ class UiCommandListener:
 
     def _handle_stop_search(self):
         print("[UI COMMAND] stop_search", flush=True)
+        if self.stop_search_callback is not None:
+            self.stop_search_callback("", "face_ui")
+            return
         try:
             self.search_task.request_cancel()
         except Exception:
@@ -460,7 +485,115 @@ def main():
         map_name=map_name,
         status_callback=lambda status: face_show_search_status(face, status),
     )
-    ui_commands = UiCommandListener(robot, search_task, face, perceptions)
+    command_bus = CommandBus(max_size=32)
+    mobile_gateway = None
+    operation_lock = threading.Lock()
+    operation_generation = 0
+
+    def invalidate_operation():
+        nonlocal operation_generation
+        with operation_lock:
+            operation_generation += 1
+            return operation_generation
+
+    def current_operation_generation():
+        with operation_lock:
+            return operation_generation
+
+    def execute_action_if_current(generation, move_cmd, speed, arm_cmd):
+        """Serialize the final generation check with action dispatch."""
+        with operation_lock:
+            if generation != operation_generation:
+                return False
+            robot.move(move_cmd, speed)
+            robot.control_arm(arm_cmd)
+            return True
+
+    mobile_control = MobileTeleopController(
+        robot,
+        search_task,
+        status_callback=lambda status: face.send_status(status),
+        preempt_callback=invalidate_operation,
+    )
+
+    def stop_all(scope="all", request_id="", source="interface"):
+        print(f"[STOP] source={source} scope={scope} request={request_id}", flush=True)
+        invalidate_operation()
+        search_task.request_cancel()
+        mobile_control.stop(reason="stopped")
+        robot.stop()
+        threading.Thread(target=robot.cancel_navigation, daemon=True).start()
+        speech = "Stopping search, navigation, and robot movement now."
+        face.send_emotion("neutral")
+        face.send_status({
+            "mode": "stopped",
+            "phase": "stopped",
+            "message": speech,
+            "can_talk": True,
+        })
+        face.send_message(speech)
+        if mobile_gateway is not None and request_id:
+            mobile_gateway.publish_response(request_id, speech, source, status="stopped")
+        if source == "robot_mic":
+            threading.Thread(target=perceptions.speak, args=("Stopping now.",), daemon=True).start()
+
+    def cancel_search(request_id="", source="interface"):
+        print(f"[SEARCH CANCEL] source={source} request={request_id}", flush=True)
+        invalidate_operation()
+        search_task.request_cancel()
+        robot.stop()
+        threading.Thread(target=robot.cancel_navigation, daemon=True).start()
+        speech = "The current search is being cancelled."
+        face.send_status({
+            "mode": "stopped",
+            "phase": "cancelled",
+            "message": speech,
+            "can_talk": True,
+        })
+        if mobile_gateway is not None and request_id:
+            mobile_gateway.publish_response(request_id, speech, source, status="cancelled")
+
+    def show_rviz(request_id="", source="interface"):
+        def _launch():
+            ok = robot.launch_rviz()
+            speech = "RViz opened." if ok else "RViz could not be opened on the robot display."
+            face.send_status({
+                "mode": "ready" if ok else "not_found",
+                "phase": "rviz",
+                "message": speech,
+                "can_talk": True,
+            })
+            if mobile_gateway is not None and request_id:
+                mobile_gateway.publish_response(
+                    request_id, speech, source,
+                    status="completed" if ok else "failed",
+                )
+        threading.Thread(target=_launch, daemon=True).start()
+
+    mobile_gateway = MobileGateway(
+        command_bus=command_bus,
+        map_provider=lambda: robot.get_map_snapshot(map_name),
+        telemetry_provider=robot.get_mobile_state,
+        stop_callback=stop_all,
+        search_cancel_callback=cancel_search,
+        teleop_callback=mobile_control.update,
+        rviz_callback=show_rviz,
+    )
+    face.add_listener(mobile_gateway.broadcast_event)
+    mobile_gateway.start()
+
+    microphone_commands = MicrophoneCommandProducer(
+        perceptions,
+        command_bus,
+        emergency_callback=stop_all,
+        search_cancel_callback=cancel_search,
+    )
+    microphone_commands.start()
+
+    ui_commands = UiCommandListener(
+        robot, search_task, face, perceptions,
+        stop_search_callback=cancel_search,
+    )
     ui_commands.start()
 
     print("--- 1.5B SYSTEM ACTIVE ---", flush=True)
@@ -475,17 +608,21 @@ def main():
 
     try:
         while True:
-            # Always grab latest vision (non-blocking)
+            envelope = command_bus.get(timeout=0.25)
+            if envelope is None:
+                continue
+
+            # Capture current sensor context immediately before processing.
             frame, vision_data = perceptions.see()
             lidar_distance     = get_lidar_distance(perceptions)
             objects            = get_objects_from_vision(vision_data)
             vision_desc        = get_vision_description(vision_data)
 
-            command = perceptions.listen()
-            if not command:
-                continue
+            command = envelope.text
+            command_generation = current_operation_generation()
+            mobile_gateway.publish_processing(envelope.request_id, command, envelope.source)
 
-            print(f"\nUser: {command}", flush=True)
+            print(f"\nUser ({envelope.source}, {envelope.request_id}): {command}", flush=True)
 
             # ── PLACE MEMORY COMMANDS ───────────────────────────
             # 1. Save place
@@ -500,8 +637,7 @@ def main():
                     speech = f"Location saved as {save_target}."
                     print(f"[PLACES MEMORY] Saved place '{save_target}' at x={pose['x']:.2f}, y={pose['y']:.2f}, yaw={pose['yaw']:.2f}", flush=True)
                 
-                perceptions.speak(speech)
-                face.send_message(f"You: {command}\nAI: {speech}")
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
                 continue
 
             # 2. Rename place
@@ -512,8 +648,7 @@ def main():
                     speech = f"I have renamed {old_n} to {new_n} in my memory."
                 else:
                     speech = f"I could not find a place named {old_n} in my memory."
-                perceptions.speak(speech)
-                face.send_message(f"You: {command}\nAI: {speech}")
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
                 continue
 
             # 3. Delete place
@@ -523,8 +658,7 @@ def main():
                     speech = f"I have removed {delete_target} from my memory."
                 else:
                     speech = f"I could not find a place named {delete_target} in my memory."
-                perceptions.speak(speech)
-                face.send_message(f"You: {command}\nAI: {speech}")
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
                 continue
 
             # 4. List places
@@ -534,8 +668,7 @@ def main():
                     speech = f"I know the following places on this map: {', '.join(names)}."
                 else:
                     speech = "I do not have any saved places for this map yet."
-                perceptions.speak(speech)
-                face.send_message(f"You: {command}\nAI: {speech}")
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
                 continue
 
             # ── SEARCH REQUEST ─────────────────────────────────
@@ -554,6 +687,15 @@ def main():
                         face, target, "starting", 0, 0, objects,
                         message=speech_start, can_talk=False
                     )
+
+                    if command_generation != current_operation_generation():
+                        mobile_gateway.publish_response(
+                            envelope.request_id,
+                            "Navigation command cancelled.",
+                            envelope.source,
+                            status="cancelled",
+                        )
+                        continue
                     
                     robot.cancel_navigation()
                     robot.stop()
@@ -562,9 +704,19 @@ def main():
                         
                     goal_started = robot.goto_map(saved_place["x"], saved_place["y"], saved_place["yaw"])
                     if not goal_started:
+                        if command_generation != current_operation_generation():
+                            mobile_gateway.publish_response(
+                                envelope.request_id,
+                                "Navigation command cancelled.",
+                                envelope.source,
+                                status="cancelled",
+                            )
+                            continue
                         speech = f"I could not start navigation to {target}."
-                        perceptions.speak(speech)
-                        face.send_message(f"You: {command}\nAI: {speech}")
+                        deliver_response(
+                            perceptions, face, mobile_gateway, envelope, command, speech,
+                            status="failed",
+                        )
                         face_show_search(
                             face, target, "navigation_failed", 0, 0, objects,
                             message=speech, can_talk=True
@@ -574,6 +726,7 @@ def main():
                     t_start = time.time()
                     nav_timeout = 35.0
                     arrived = False
+                    interrupted = False
                     stuck_timeout = 8.0
                     last_progress = time.time()
                     best_d = None
@@ -584,6 +737,9 @@ def main():
                             perceptions.set_moving(True)
                             
                         while time.time() - t_start < nav_timeout:
+                            if command_generation != current_operation_generation():
+                                interrupted = True
+                                break
                             d = robot.distance_to(saved_place["x"], saved_place["y"])
                             distance_msg = "Navigating to place..."
                             if d is not None:
@@ -616,8 +772,16 @@ def main():
                         if hasattr(perceptions, "set_moving"):
                             perceptions.set_moving(False)
                         robot.stop()
+                        robot.clear_navigation_goal()
+
+                    if interrupted:
+                        robot.cancel_navigation()
                         
-                    if arrived:
+                    if interrupted:
+                        speech = f"Navigation to {target} was cancelled."
+                        phase = "cancelled"
+                        found = False
+                    elif arrived:
                         speech = f"I have successfully arrived at {target}."
                         phase = "found"
                         found = True
@@ -627,8 +791,11 @@ def main():
                         found = False
                         
                     print(f"[TASK RESULT]: arrived={arrived} speech={speech}", flush=True)
-                    perceptions.speak(speech)
-                    face.send_message(f"You: {command}\nAI: {speech}")
+                    deliver_response(
+                        perceptions, face, mobile_gateway, envelope, command, speech,
+                        status="cancelled" if interrupted else ("completed" if arrived else "failed"),
+                        arrived=arrived,
+                    )
                     face_show_search(
                         face, target, phase, 1, 1, objects,
                         found=found, searched_count=1, message=speech, can_talk=True
@@ -642,7 +809,6 @@ def main():
                     speech = (f"I cannot search for '{target}'. "
                               f"Please name a real visual target, like a person, door, key, cube, chair, or bottle.")
                     print(f"[SEARCH REJECTED]: {target}", flush=True)
-                    perceptions.speak(speech)
                     face.send_emotion("sad")
                     face.send_status({
                         "mode": "not_found",
@@ -651,7 +817,10 @@ def main():
                         "message": speech,
                         "can_talk": True,
                     })
-                    face.send_message(f"You: {command}\nAI: {speech}")
+                    deliver_response(
+                        perceptions, face, mobile_gateway, envelope, command, speech,
+                        status="rejected",
+                    )
                     continue
 
                 detector = yolo_name or "open-vocabulary"
@@ -663,6 +832,15 @@ def main():
                     face, target, "starting", 0, 0, objects,
                     message=speech_start, can_talk=False
                 )
+
+                if command_generation != current_operation_generation():
+                    mobile_gateway.publish_response(
+                        envelope.request_id,
+                        "Search command cancelled.",
+                        envelope.source,
+                        status="cancelled",
+                    )
+                    continue
 
                 try:
                     result = search_task.search(target)
@@ -679,8 +857,12 @@ def main():
                     searched_count = min(searched_count, waypoint_total)
 
                 print(f"[TASK RESULT]: found={found} speech={speech}", flush=True)
-                perceptions.speak(speech)
-                face.send_message(f"You: {command}\nAI: {speech}")
+                deliver_response(
+                    perceptions, face, mobile_gateway, envelope, command, speech,
+                    status="cancelled" if result.get("cancelled") else "completed",
+                    found=bool(found),
+                    where=where,
+                )
                 face_show_search(
                     face, target, phase,
                     searched_count if searched_count else 0,
@@ -713,6 +895,16 @@ def main():
                 lidar_distance=lidar_distance,
             )
 
+            if command_generation != current_operation_generation():
+                robot.stop()
+                mobile_gateway.publish_response(
+                    envelope.request_id,
+                    "Command cancelled by a newer safety command.",
+                    envelope.source,
+                    status="cancelled",
+                )
+                continue
+
             speech    = safe_data.get("speech", "")
             thought   = safe_data.get("thought", "")
             action    = safe_data.get("action", {})
@@ -736,13 +928,34 @@ def main():
 
             # Speak the speech string only — NOT the dict
             perceptions.speak(speech)
-
-            robot.move(move_cmd, speed)
-            robot.control_arm(arm_cmd)
+            if not execute_action_if_current(
+                command_generation, move_cmd, speed, arm_cmd
+            ):
+                robot.stop()
+                mobile_gateway.publish_response(
+                    envelope.request_id,
+                    "Command cancelled before movement.",
+                    envelope.source,
+                    status="cancelled",
+                )
+                continue
+            mobile_gateway.publish_response(
+                envelope.request_id,
+                speech,
+                envelope.source,
+                status="completed",
+                latency_ms=round(float(latency) * 1000.0, 1),
+            )
 
     except KeyboardInterrupt:
         print("\n[MAIN] Stopping...", flush=True)
     finally:
+        try:
+            microphone_commands.stop()
+            mobile_control.close()
+            mobile_gateway.stop()
+        except Exception:
+            pass
         try:
             face.send_emotion("neutral")
             face.send_status({

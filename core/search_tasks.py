@@ -148,6 +148,8 @@ class MapSearchTask:
         self._last_status_emit = 0.0
         self._current_target = ""
         self._total_waypoints = 0
+        self._all_waypoints: List[Dict] = []
+        self._current_waypoint: Optional[Dict] = None
         self._cancel_event = threading.Event()
 
     def _dist(self, a, b):
@@ -185,6 +187,8 @@ class MapSearchTask:
         self._last_status_emit = 0.0
         self._current_target = target_text
         self._total_waypoints = 0
+        self._all_waypoints = []
+        self._current_waypoint = None
         self.clear_cancel()
 
     def _emit_status(self, target_text: str, phase: str,
@@ -219,6 +223,7 @@ class MapSearchTask:
             "message": message,
             "objects": objects[:4],
             "can_talk": bool(can_talk) if can_talk is not None else False,
+            "current_waypoint": dict(self._current_waypoint) if self._current_waypoint else None,
         }
         try:
             self._status_callback(payload)
@@ -584,6 +589,7 @@ class MapSearchTask:
             self.map_name, spacing_m=spacing, max_points=max_points,
             clearance_m=clearance,
         )
+        self._all_waypoints = [dict(point) for point in all_waypoints]
         self._total_waypoints = len(all_waypoints)
         if not all_waypoints:
             msg = f"I have no map waypoints to search for {target_text}."
@@ -629,6 +635,8 @@ class MapSearchTask:
             else:
                 wp = min(unvisited, key=lambda p: math.hypot(p["x"] - pose["x"], p["y"] - pose["y"]))
                 wp_dist = math.hypot(wp["x"] - pose["x"], wp["y"] - pose["y"])
+
+            self._current_waypoint = {"x": float(wp["x"]), "y": float(wp["y"]), "yaw": float(wp.get("yaw", 0.0))}
 
             overall_idx = min(len(self._visited) + 1, self._total_waypoints)
             print(f"[SEARCH] wp {overall_idx}/{self._total_waypoints} "

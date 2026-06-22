@@ -61,6 +61,8 @@ class Perceptions:
         self._last_stt_error_time = 0.0
         self._last_stt_error_text = ""
         self._last_robot_speech_end = 0.0
+        self._speaking_event = threading.Event()
+        self._speech_lock = threading.Lock()
         self.is_muted = False
         self._robot_moving = False
         self._search_target = None
@@ -522,7 +524,7 @@ class Perceptions:
             time.sleep(remaining)
 
     def listen(self, timeout=5, phrase_time_limit=8):
-        if self.is_muted:
+        if self.is_muted or self._speaking_event.is_set():
             time.sleep(0.5)
             return None
 
@@ -553,7 +555,7 @@ class Perceptions:
                 print(f"[LISTEN ERROR] {e}", flush=True)
                 return None
 
-        if self.is_muted:
+        if self.is_muted or self._speaking_event.is_set():
             return None
 
         try:
@@ -602,6 +604,8 @@ class Perceptions:
             )
             if reject:
                 print(f"[STT] Rejected low-confidence transcription: {quality_text} text={text!r}", flush=True)
+                return None
+            if self._speaking_event.is_set():
                 return None
             if len(text) > 2 and re.search(r"[A-Za-z0-9]", text):
                 print(f"[HEARD] \"{text}\" ({quality_text}, model={self.whisper_model_name})", flush=True)
@@ -768,12 +772,15 @@ class Perceptions:
     def speak(self, text):
         if not text:
             return
-        print(f"[ROBOT VOICE]: {text}", flush=True)
-        try:
-            import shlex
-            cmd = f"espeak-ng -v en-us {shlex.quote(str(text))} --stdout | aplay -D hw:3,0 > /dev/null 2>&1"
-            os.system(cmd)
-        except Exception as e:
-            print(f"Speaker Error: {e}", flush=True)
-        finally:
-            self._last_robot_speech_end = time.monotonic()
+        with self._speech_lock:
+            print(f"[ROBOT VOICE]: {text}", flush=True)
+            self._speaking_event.set()
+            try:
+                import shlex
+                cmd = f"espeak-ng -v en-us {shlex.quote(str(text))} --stdout | aplay -D hw:3,0 > /dev/null 2>&1"
+                os.system(cmd)
+            except Exception as e:
+                print(f"Speaker Error: {e}", flush=True)
+            finally:
+                self._last_robot_speech_end = time.monotonic()
+                self._speaking_event.clear()

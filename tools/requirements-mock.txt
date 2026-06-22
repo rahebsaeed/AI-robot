@@ -1,0 +1,2 @@
+Pillow>=10,<12
+websockets>=12,<16

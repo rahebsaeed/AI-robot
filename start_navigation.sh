@@ -19,6 +19,8 @@ ROBOT_IP=$(hostname -I | awk '{print $1}')
 MAP_FOLDER="/root/yahboomcar_ws/src/yahboomcar_nav/maps"
 AI_FOLDER="/home/jetson/AI"
 AI_LOG="/tmp/ai_companion.log"
+AMCL_TOOL="$AI_FOLDER/tools/amcl_initializer.py"
+LAST_AMCL_POSE_FILE="$AI_FOLDER/config/last_amcl_pose.json"
 CLEANED_UP=0
 
 run_in_docker() {
@@ -172,6 +174,247 @@ wait_for_topic() {
 
     echo "  WARNING: $TOPIC not found"
     return 1
+}
+
+wait_for_service() {
+    local service="$1"
+    local timeout="$2"
+
+    echo "Waiting for $service ..."
+    for _ in $(seq 1 "$timeout"); do
+        if run_in_docker "rosservice list 2>/dev/null | grep -q '^$service$'"; then
+            echo "  OK: $service"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "  ERROR: $service not found"
+    return 1
+}
+
+run_amcl_tool() {
+    if [ ! -f "$AMCL_TOOL" ]; then
+        echo "[AMCL ERROR] Missing helper: $AMCL_TOOL"
+        return 1
+    fi
+
+    local quoted_args=""
+    local arg escaped
+    for arg in "$@"; do
+        printf -v escaped ' %q' "$arg"
+        quoted_args+="$escaped"
+    done
+
+    docker exec -i "$CONTAINER" /bin/bash -lc "
+        export ROBOT_TYPE=X3plus
+        export LASER_TYPE=4ROS
+        export ROS_MASTER_URI=http://$ROBOT_IP:11311
+        export ROS_IP=$ROBOT_IP
+        unset ROS_HOSTNAME
+        source /root/yahboomcar_ws/devel/setup.bash
+        python3 -$quoted_args
+    " < "$AMCL_TOOL"
+}
+
+configure_amcl_global_search() {
+    local min_particles="${AI_AMCL_MIN_PARTICLES:-500}"
+    local max_particles="${AI_AMCL_MAX_PARTICLES:-5000}"
+    local laser_max_beams="${AI_AMCL_LASER_MAX_BEAMS:-60}"
+    local update_min_a="${AI_AMCL_UPDATE_MIN_A:-0.20}"
+    echo "[AMCL] Configuring particle range: $min_particles..$max_particles"
+    run_in_docker "
+if command -v rosrun >/dev/null 2>&1 && rosrun dynamic_reconfigure dynparam get /amcl >/dev/null 2>&1; then
+    rosrun dynamic_reconfigure dynparam set /amcl max_particles $max_particles >/dev/null 2>&1 || true
+    rosrun dynamic_reconfigure dynparam set /amcl min_particles $min_particles >/dev/null 2>&1 || true
+    rosrun dynamic_reconfigure dynparam set /amcl laser_max_beams $laser_max_beams >/dev/null 2>&1 || true
+    rosrun dynamic_reconfigure dynparam set /amcl update_min_a $update_min_a >/dev/null 2>&1 || true
+    rosrun dynamic_reconfigure dynparam set /amcl recovery_alpha_slow 0.001 >/dev/null 2>&1 || true
+    rosrun dynamic_reconfigure dynparam set /amcl recovery_alpha_fast 0.1 >/dev/null 2>&1 || true
+fi
+    " || true
+}
+
+select_amcl_initial_pose() {
+    AMCL_INITIAL_SOURCE=""
+    AMCL_INITIAL_X_VALUE=""
+    AMCL_INITIAL_Y_VALUE=""
+    AMCL_INITIAL_YAW_VALUE=""
+
+    if [ -n "${AI_AMCL_INITIAL_X:-}" ] || [ -n "${AI_AMCL_INITIAL_Y:-}" ] || [ -n "${AI_AMCL_INITIAL_YAW:-}" ]; then
+        if [ -z "${AI_AMCL_INITIAL_X:-}" ] || [ -z "${AI_AMCL_INITIAL_Y:-}" ] || [ -z "${AI_AMCL_INITIAL_YAW:-}" ]; then
+            echo "[AMCL ERROR] Set AI_AMCL_INITIAL_X, AI_AMCL_INITIAL_Y, and AI_AMCL_INITIAL_YAW together."
+            return 1
+        fi
+        AMCL_INITIAL_SOURCE="configured"
+        AMCL_INITIAL_X_VALUE="$AI_AMCL_INITIAL_X"
+        AMCL_INITIAL_Y_VALUE="$AI_AMCL_INITIAL_Y"
+        AMCL_INITIAL_YAW_VALUE="$AI_AMCL_INITIAL_YAW"
+        return 0
+    fi
+
+    if [ "${AI_AMCL_USE_SAVED_POSE:-1}" = "0" ] || [ ! -f "$LAST_AMCL_POSE_FILE" ]; then
+        return 1
+    fi
+
+    local saved_values
+    saved_values=$(python3 - "$LAST_AMCL_POSE_FILE" "$MAP_NAME" "${AI_AMCL_SAVED_POSE_MAX_AGE:-604800}" <<'PY'
+import json
+import math
+import sys
+import time
+
+path, map_name, max_age = sys.argv[1], sys.argv[2], float(sys.argv[3])
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    values = [float(data[key]) for key in ("x", "y", "yaw")]
+    if data.get("map") != map_name or not all(math.isfinite(value) for value in values):
+        raise ValueError("saved pose belongs to another map or is invalid")
+    if time.time() - float(data.get("saved_at", 0.0)) > max_age:
+        raise ValueError("saved pose is too old")
+    print("{:.9f} {:.9f} {:.9f}".format(*values))
+except Exception:
+    raise SystemExit(1)
+PY
+    ) || return 1
+
+    read -r AMCL_INITIAL_X_VALUE AMCL_INITIAL_Y_VALUE AMCL_INITIAL_YAW_VALUE <<< "$saved_values"
+    AMCL_INITIAL_SOURCE="saved"
+    return 0
+}
+
+trigger_global_localization() {
+    echo "[AMCL] Distributing particles over the full map..."
+    run_in_docker "rosservice call /global_localization '{}' >/dev/null" || return 1
+    run_in_docker "rosservice call /request_nomotion_update '{}' >/dev/null 2>&1 || true"
+    sleep 2
+}
+
+initialize_amcl() {
+    local attempts="${AI_AMCL_ATTEMPTS:-3}"
+    local spin_seconds="${AI_AMCL_SPIN_SECONDS:-12}"
+    local refinement_spin_seconds="${AI_AMCL_REFINEMENT_SPIN_SECONDS:-5}"
+    local spin_angular="${AI_AMCL_SPIN_ANGULAR:-0.65}"
+    local check_timeout="${AI_AMCL_CHECK_TIMEOUT:-4}"
+    local max_position_std="${AI_AMCL_MAX_POSITION_STD:-0.70}"
+    local max_yaw_std="${AI_AMCL_MAX_YAW_STD:-0.55}"
+
+    echo "[AMCL] Validating map, lidar data, odometry, and laser transforms..."
+    run_amcl_tool preflight --timeout 12 --min-ranges 20 || return 1
+    configure_amcl_global_search
+
+    local has_initial_pose=0
+    if select_amcl_initial_pose; then
+        has_initial_pose=1
+        echo "[AMCL] Seeding from $AMCL_INITIAL_SOURCE pose: x=$AMCL_INITIAL_X_VALUE y=$AMCL_INITIAL_Y_VALUE yaw=$AMCL_INITIAL_YAW_VALUE"
+        run_amcl_tool publish \
+            "$AMCL_INITIAL_X_VALUE" "$AMCL_INITIAL_Y_VALUE" "$AMCL_INITIAL_YAW_VALUE" \
+            --xy-std "${AI_AMCL_INITIAL_XY_STD:-0.35}" \
+            --yaw-std "${AI_AMCL_INITIAL_YAW_STD:-0.35}" || return 1
+
+        echo "[AMCL] Checking seeded pose before moving the robot..."
+        if run_amcl_tool check \
+            --timeout "$check_timeout" \
+            --max-position-std "$max_position_std" \
+            --max-yaw-std "$max_yaw_std" \
+            --samples 3; then
+            echo "[AMCL] Seeded pose converged without a calibration rotation."
+            save_amcl_pose_on_exit
+            return 0
+        fi
+        echo "[AMCL WARNING] Seeded pose needs scan refinement."
+    else
+        trigger_global_localization || return 1
+    fi
+
+    local attempt angular duration redistributed
+    for attempt in $(seq 1 "$attempts"); do
+        redistributed=0
+        if [ "$attempt" -ge 3 ] && [ $((attempt % 2)) -eq 1 ]; then
+            trigger_global_localization || return 1
+            redistributed=1
+        fi
+        angular="$spin_angular"
+        if [ $((attempt % 2)) -eq 0 ]; then
+            angular="-$spin_angular"
+        fi
+
+        if [ "$attempt" -eq 1 ] && [ "$has_initial_pose" = "0" ]; then
+            duration="$spin_seconds"
+        elif [ "$redistributed" = "1" ]; then
+            duration="$spin_seconds"
+        else
+            duration="$refinement_spin_seconds"
+        fi
+
+        echo "[AMCL] Localization attempt $attempt/$attempts: ${duration}s scan at angular.z=$angular"
+        run_amcl_tool spin --duration "$duration" --angular "$angular" || return 1
+        run_in_docker "rosservice call /request_nomotion_update '{}' >/dev/null 2>&1 || true"
+        sleep 1
+
+        if run_amcl_tool check \
+            --timeout "$check_timeout" \
+            --max-position-std "$max_position_std" \
+            --max-yaw-std "$max_yaw_std" \
+            --samples 3; then
+            echo "[AMCL] Localization converged successfully."
+            save_amcl_pose_on_exit
+            return 0
+        fi
+
+        if [ "$has_initial_pose" = "1" ]; then
+            echo "[AMCL WARNING] The seeded pose has not converged yet; retaining its particle cloud for refinement."
+            has_initial_pose=0
+        elif [ "$redistributed" = "1" ]; then
+            echo "[AMCL WARNING] Fresh global localization attempt $attempt did not converge."
+        else
+            echo "[AMCL WARNING] Pose is not converged yet; refining without resetting particles."
+        fi
+    done
+
+    echo "[AMCL ERROR] Unable to establish a reliable pose after $attempts attempts."
+    echo "[AMCL ERROR] For a fixed starting location, set AI_AMCL_INITIAL_X, AI_AMCL_INITIAL_Y, and AI_AMCL_INITIAL_YAW (radians)."
+    return 1
+}
+
+save_amcl_pose_on_exit() {
+    if [ "${AI_AMCL_SAVE_POSE:-1}" = "0" ] || [ ! -f "$AMCL_TOOL" ]; then
+        return
+    fi
+
+    local output snapshot
+    output=$(run_amcl_tool snapshot \
+        --timeout 3 \
+        --max-position-std "${AI_AMCL_MAX_POSITION_STD:-0.70}" \
+        --max-yaw-std "${AI_AMCL_MAX_YAW_STD:-0.55}" 2>/dev/null) || return
+    snapshot=$(printf '%s\n' "$output" | sed -n 's/^AMCL_SNAPSHOT //p' | tail -n 1)
+    [ -n "$snapshot" ] || return
+
+    mkdir -p "$(dirname "$LAST_AMCL_POSE_FILE")"
+    python3 - "$LAST_AMCL_POSE_FILE" "$MAP_NAME" "$snapshot" <<'PY'
+import json
+import os
+import sys
+
+path, map_name, payload = sys.argv[1], sys.argv[2], sys.argv[3]
+data = json.loads(payload)
+data["map"] = map_name
+temporary = path + ".tmp"
+with open(temporary, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, sort_keys=True)
+    handle.write("\n")
+os.replace(temporary, path)
+PY
+    echo "[AMCL] Saved converged pose for the next startup: $LAST_AMCL_POSE_FILE"
+}
+
+startup_fail() {
+    echo "[STARTUP ERROR] $1"
+    stop_host_ai
+    stop_robot
+    stop_ai_bridges
+    stop_ros
+    exit 1
 }
 
 start_lidar_bridge() {
@@ -614,6 +857,13 @@ start_ai() {
     export AI_RVIZ_AUTO_INSTALL="${AI_RVIZ_AUTO_INSTALL:-1}"
     export AI_RVIZ_DOCKER_IMAGE="${AI_RVIZ_DOCKER_IMAGE:-osrf/ros:noetic-desktop-full}"
     export AI_RVIZ_ALLOW_PULL="${AI_RVIZ_ALLOW_PULL:-0}"
+    export AI_MOBILE_ENABLED="${AI_MOBILE_ENABLED:-1}"
+    export AI_MOBILE_HOST="${AI_MOBILE_HOST:-0.0.0.0}"
+    export AI_MOBILE_PORT="${AI_MOBILE_PORT:-8765}"
+    export AI_MOBILE_TOKEN="${AI_MOBILE_TOKEN:-}"
+    if [ "$AI_MOBILE_ENABLED" != "0" ] && [ -z "$AI_MOBILE_TOKEN" ]; then
+        echo "[MOBILE WARNING] AI_MOBILE_TOKEN is empty. The WebSocket is open on the local network."
+    fi
     if [ "${AI_OPEN_VOCAB}" != "0" ] && [ -f "$AI_FOLDER/yolov8s-worldv2.pt" ]; then
         export AI_YOLO_WORLD_MODEL="$AI_FOLDER/yolov8s-worldv2.pt"
     fi
@@ -636,6 +886,7 @@ cleanup() {
     echo "========================================"
 
     stop_host_ai
+    save_amcl_pose_on_exit
     stop_robot
     stop_lidar_stack
     save_map_on_exit
@@ -694,37 +945,23 @@ sleep 5
 echo "[8/12] Starting Yahboom body, lidar, and Astra camera..."
 run_in_docker "roslaunch yahboomcar_nav laser_astrapro_bringup.launch > /tmp/navigation_bringup.log 2>&1 &"
 sleep 15
+wait_for_topic "/scan" 30 || startup_fail "Lidar topic /scan did not start. Check /tmp/navigation_bringup.log."
 
 echo "[9/12] Starting navigation with map: $MAP_NAME"
 run_in_docker "roslaunch yahboomcar_nav yahboomcar_navigation.launch map:=$MAP_NAME use_rviz:=false > /tmp/navigation_stack.log 2>&1 &"
 sleep 10
 
 echo "[10/12] AMCL initialization and costmap preparation..."
+wait_for_topic "/map" 30 || startup_fail "Map topic /map did not start. Check the map name and /tmp/navigation_stack.log."
+wait_for_topic "/tf" 20 || startup_fail "TF topic /tf did not start."
+wait_for_service "/global_localization" 30 || startup_fail "AMCL global localization service did not start."
+wait_for_service "/move_base/clear_costmaps" 30 || startup_fail "move_base clear_costmaps service did not start."
 
-echo "-> Waiting for AMCL/global localization services..."
-for service in /global_localization /move_base/clear_costmaps; do
-    echo "Waiting for $service ..."
-    for i in $(seq 1 30); do
-        if run_in_docker "rosservice list | grep -q '^$service$'"; then
-            echo "  OK: $service"
-            break
-        fi
-        sleep 1
-    done
-done
-
-if [ "${AI_AMCL_GLOBAL_LOCALIZATION:-1}" != "0" ]; then
-    echo "-> AMCL global localization..."
-    run_in_docker "rosservice call /global_localization '{}' >/dev/null 2>&1 || true"
-    sleep 2
+if ! initialize_amcl; then
+    startup_fail "AMCL could not determine a trustworthy robot position."
 fi
-AMCL_SPIN_SECONDS="${AI_AMCL_SPIN_SECONDS:-8}"
-AMCL_SPIN_ANGULAR="${AI_AMCL_SPIN_ANGULAR:-0.65}"
-echo "-> AMCL calibration full spin (${AMCL_SPIN_SECONDS}s at angular.z=${AMCL_SPIN_ANGULAR})..."
-run_in_docker "timeout ${AMCL_SPIN_SECONDS}s rostopic pub -r 10 /cmd_vel geometry_msgs/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: ${AMCL_SPIN_ANGULAR}}}' >/dev/null 2>&1 || true"
-stop_robot
-sleep 1
-echo "-> Confirming AMCL robot position..."
+
+echo "-> Confirming final AMCL robot position..."
 print_amcl_pose
 
 echo "-> Clearing move_base costmaps..."
@@ -732,7 +969,6 @@ run_in_docker "rosservice call /move_base/clear_costmaps '{}' >/dev/null 2>&1 ||
 sleep 2
 
 echo "[11/12] Waiting for required topics..."
-wait_for_topic "/scan" 20 || true
 wait_for_topic "/camera/rgb/image_raw" 20 || true
 
 echo "[12/12] Starting AI bridges and AI companion..."
@@ -762,6 +998,10 @@ echo "  tail -f /tmp/navigation_bringup.log"
 echo "  tail -f /tmp/ai_cmd_vel_bridge.log"
 echo "  tail -f /tmp/ai_lidar_udp_bridge.log"
 echo "  tail -f /tmp/ros_rgb_camera_ai_bridge.log"
+echo ""
+echo "Android application:"
+echo "  WebSocket: ws://$ROBOT_IP:${AI_MOBILE_PORT:-8765}"
+echo "  Pairing token: configure AI_MOBILE_TOKEN before launch"
 echo "=================================================="
 echo ""
 

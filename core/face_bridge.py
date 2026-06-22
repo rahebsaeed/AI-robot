@@ -1,5 +1,6 @@
 import json
 import socket
+import threading
 
 
 class FaceBridge:
@@ -13,6 +14,29 @@ class FaceBridge:
     def __init__(self, host="127.0.0.1", port=5005):
         self.host = host
         self.port = port
+        self._listeners = []
+        self._listeners_lock = threading.Lock()
+
+    def add_listener(self, callback):
+        if callback is None:
+            return
+        with self._listeners_lock:
+            if callback not in self._listeners:
+                self._listeners.append(callback)
+
+    def remove_listener(self, callback):
+        with self._listeners_lock:
+            if callback in self._listeners:
+                self._listeners.remove(callback)
+
+    def _notify(self, event):
+        with self._listeners_lock:
+            listeners = list(self._listeners)
+        for callback in listeners:
+            try:
+                callback(dict(event))
+            except Exception as e:
+                print(f"[FaceBridge Listener Error]: {e}")
 
     def _send(self, payload):
         try:
@@ -29,6 +53,7 @@ class FaceBridge:
         # Send full message.
         # robot_face.py will split it into 30-word chunks.
         self._send(f"msg:{text}")
+        self._notify({"type": "message", "text": str(text)})
 
     def send_status(self, status):
         if not isinstance(status, dict):
@@ -39,12 +64,16 @@ class FaceBridge:
         except Exception:
             return
         self._send(f"status:{payload}")
+        event = {"type": "status"}
+        event.update(status)
+        self._notify(event)
 
     def send_emotion(self, emotion):
         if not emotion:
             return
 
         self._send(emotion)
+        self._notify({"type": "emotion", "emotion": str(emotion)})
 
     def show_ai_response(self, text):
         if not text:

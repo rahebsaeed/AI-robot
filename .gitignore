@@ -1,1 +1,6 @@
 /.venv
+/.venv-mock
+/__pycache__
+/__pycache__/
+__pycache__
+/config/last_amcl_pose.json

@@ -15,3 +15,4 @@ optimum
 openai-whisper
 PyQt5
 ultralytics
+websockets>=12,<16

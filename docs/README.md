@@ -4,6 +4,13 @@ This document explains how the AI companion system is structured, how the launch
 
 Algorithm SVG schema: [algorithm_schema.svg](./algorithm_schema.svg)
 
+Android integration:
+
+- [Mobile WebSocket protocol](./MOBILE_PROTOCOL.md)
+- [Detailed Android build prompt](./ANDROID_APP_BUILD_PROMPT.md)
+- [Build and PC simulator test guide](./ANDROID_PC_TEST.md)
+- [Android project](../android-app/README.md)
+
 ## 1. System Goal
 
 The project combines:
@@ -37,7 +44,11 @@ The core user workflow is:
 | `core/search_tasks.py` | Map-based visual search algorithm. Resolves object names, chooses waypoints, checks live vision, handles stuck waypoints, and reports results. |
 | `core/face_bridge.py` | Sends UDP messages to the Qt face interface. |
 | `core/places_memory.py` | Stores named map positions for later navigation commands. |
+| `core/command_bus.py` | Shared priority queue for the robot microphone and Android commands. |
+| `core/mobile_gateway.py` | Authenticated local WebSocket, map transfer, pose telemetry, commands, and responses. |
+| `core/mobile_control.py` | Dead-man manual control and disconnect/heartbeat safety stop. |
 | `robot_face.py` | Qt face UI, status display, and buttons. |
+| `android-app/` | Kotlin/Compose mobile application with STT, ROS map, AMCL pose, status, stop, and teleoperation. |
 
 ## 3. Runtime Architecture
 
@@ -79,6 +90,7 @@ The two zones communicate through UDP and ROS topics.
 | `5030` | Docker to host | JPEG RGB camera frames from `/camera/rgb/image_raw`. |
 | `5040` | Docker to host | AMCL pose from `/amcl_pose`. |
 | `5006` | Face UI to main AI | UI button commands such as `stop_search`, `show_rviz`, `mic_off`, `mic_on`. |
+| `8765` | Android and host, bidirectional | Versioned WebSocket commands, responses, map, status, and robot pose. |
 
 ## 5. Launch Sequence
 
@@ -101,13 +113,15 @@ The two zones communicate through UDP and ROS topics.
 9. Starts `roscore`.
 10. Starts Yahboom body, lidar, and Astra camera launch.
 11. Starts navigation with the selected map.
-12. Waits for AMCL and move_base services.
-13. Runs AMCL global localization if enabled.
-14. Spins the robot for AMCL calibration.
-15. Stops the robot after calibration.
-16. Prints the current AMCL pose.
-17. Clears move_base costmaps.
-18. Waits for `/scan` and `/camera/rgb/image_raw`.
+12. Verifies `/scan`, `/map`, `/tf`, AMCL, and move_base services.
+13. Validates usable laser ranges and the `odom -> base -> laser` TF chain.
+14. Seeds AMCL from a configured or saved pose when available; otherwise starts
+    global localization.
+15. Runs up to three alternating full rotations and requests AMCL no-motion
+    updates between attempts.
+16. Requires covariance convergence and a valid `map -> base` transform.
+17. Prints the verified AMCL pose and clears move_base costmaps.
+18. Waits for `/camera/rgb/image_raw`.
 19. Starts UDP bridges:
     - lidar bridge
     - command bridge
@@ -115,6 +129,38 @@ The two zones communicate through UDP and ROS topics.
     - pose bridge
 20. Starts RViz.
 21. Starts the AI companion.
+
+### AMCL startup configuration
+
+For a robot that always starts at a known dock, configure the dock pose in map
+coordinates. Yaw is in radians:
+
+```bash
+export AI_AMCL_INITIAL_X=1.20
+export AI_AMCL_INITIAL_Y=-0.45
+export AI_AMCL_INITIAL_YAW=1.57
+./start_navigation.sh salle_robotique
+```
+
+As soon as AMCL converges, and again on a clean CTRL+C shutdown, the launcher
+saves the pose in `config/last_amcl_pose.json` and uses it on the next startup. Set
+`AI_AMCL_USE_SAVED_POSE=0` if the robot was physically moved while powered off.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AI_AMCL_ATTEMPTS` | `3` | Maximum localization rotations/checks. |
+| `AI_AMCL_SPIN_SECONDS` | `12` | Duration of a full global-localization rotation. |
+| `AI_AMCL_REFINEMENT_SPIN_SECONDS` | `5` | Short follow-up scan that retains the existing particle cloud. |
+| `AI_AMCL_SPIN_ANGULAR` | `0.65` | Rotation speed in radians per second. |
+| `AI_AMCL_CHECK_TIMEOUT` | `4` | Maximum seconds for each covariance convergence check. |
+| `AI_AMCL_MIN_PARTICLES` | `500` | Minimum AMCL particles during initialization. |
+| `AI_AMCL_MAX_PARTICLES` | `5000` | Maximum AMCL particles during initialization. |
+| `AI_AMCL_LASER_MAX_BEAMS` | `60` | Laser beams used per AMCL update. |
+| `AI_AMCL_UPDATE_MIN_A` | `0.20` | Minimum angular change between AMCL updates in radians. |
+| `AI_AMCL_MAX_POSITION_STD` | `0.70` | Maximum accepted position standard deviation in metres. |
+| `AI_AMCL_MAX_YAW_STD` | `0.55` | Maximum accepted yaw standard deviation in radians. |
+| `AI_AMCL_USE_SAVED_POSE` | `1` | Reuse the last converged pose for the same map. |
+| `AI_AMCL_SAVED_POSE_MAX_AGE` | `604800` | Maximum saved-pose age in seconds. |
 
 ## 6. ROS Bridge Details
 
@@ -445,11 +491,11 @@ RViz displays:
 CTRL+C in `start_navigation.sh` runs `cleanup()`:
 
 1. Stop host AI and face interface.
-2. Stop robot motion and stale `/cmd_vel` publishers.
-3. Stop lidar motor and lidar ROS drivers.
-4. Save the map using `map_saver`.
-5. Stop AI bridges.
-6. Stop RViz.
+2. Save a converged AMCL pose for the next startup.
+3. Stop robot motion and stale `/cmd_vel` publishers.
+4. Stop lidar motor and lidar ROS drivers.
+5. Save the map using `map_saver`.
+6. Stop AI bridges and RViz.
 7. Stop ROS nodes and roscore.
 8. Restore terminal state.
 
@@ -532,13 +578,18 @@ docker exec -it yahboom_container /bin/bash -lc "rosservice list | grep -E 'stop
 
 ### AMCL pose is not available
 
-Check:
+The launcher now stops before autonomous navigation if AMCL is not trustworthy.
+Read the specific `AMCL_PREFLIGHT_ERROR` or `AMCL_NOT_CONVERGED` message. Check:
 
 ```bash
 docker exec -it yahboom_container /bin/bash -lc "rostopic echo /amcl_pose -n 1"
+docker exec -it yahboom_container /bin/bash -lc "rostopic echo /scan -n 1"
+docker exec -it yahboom_container /bin/bash -lc "rosrun tf tf_echo odom base_footprint"
 ```
 
-Also verify that startup completed the AMCL global localization and spin.
+If the robot starts at a fixed location, set `AI_AMCL_INITIAL_X`,
+`AI_AMCL_INITIAL_Y`, and `AI_AMCL_INITIAL_YAW` once. A clean shutdown then
+persists the converged pose for later starts.
 
 ## 19. Typical Commands
 

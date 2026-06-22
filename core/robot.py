@@ -46,6 +46,11 @@ class Robot:
         self._rviz_proc = None
         self._rviz_launching = False
         self._rviz_lock = threading.Lock()
+        self._goal_lock = threading.Lock()
+        self._navigation_goal: Optional[Dict] = None
+        self._navigation_epoch = 0
+        self._map_cache_lock = threading.Lock()
+        self._map_cache: Dict[str, Dict] = {}
 
         # ── Cached AMCL pose ──────────────────────────────────────
         self._pose_lock = threading.Lock()
@@ -153,6 +158,20 @@ source /root/yahboomcar_ws/devel/setup.bash
             self._send_move("stop", 0.0)
             time.sleep(0.05)
 
+    def send_manual_velocity(self, direction="stop", speed=0.0):
+        """Send one normalized velocity heartbeat for dead-man mobile control."""
+        direction = str(direction or "stop").strip().lower()
+        if direction not in {"forward", "backward", "left", "right", "stop"}:
+            direction = "stop"
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            speed = 0.0
+        speed = max(0.0, min(1.0, speed))
+        if direction == "stop":
+            speed = 0.0
+        self._send_move(direction, speed)
+
     def control_arm(self, command="home"):
         command = str(command).strip().lower()
         payload = {"type": "arm", "command": command}
@@ -179,6 +198,9 @@ done
 
     def cancel_navigation(self):
         print("[ROBOT NAV]: cancel move_base goal", flush=True)
+        with self._goal_lock:
+            self._navigation_goal = None
+            self._navigation_epoch += 1
         self._docker_ros(
             """
 pkill -9 -f '[a]i_nav_goal.py|[a]i_persistent_move_base_goal.py' || true
@@ -824,6 +846,8 @@ fi
         x = float(x)
         y = float(y)
         yaw = float(yaw)
+        with self._goal_lock:
+            navigation_epoch = self._navigation_epoch
 
         qz = math.sin(yaw / 2.0)
         qw = math.cos(yaw / 2.0)
@@ -866,6 +890,21 @@ PY
 """
         out = self._docker_ros(cmd, timeout=8)
         if "GOAL_SENT" in out:
+            with self._goal_lock:
+                invalidated = navigation_epoch != self._navigation_epoch
+                if not invalidated:
+                    self._navigation_goal = {
+                        "x": x,
+                        "y": y,
+                        "yaw": yaw,
+                        "frame": "map",
+                        "timestamp": time.time(),
+                    }
+            if invalidated:
+                print("[ROBOT NAV]: goal invalidated by a newer stop command", flush=True)
+                self.cancel_navigation()
+                self.stop()
+                return False
             print("[ROBOT NAV]: simple goal sent OK", flush=True)
             return True
 
@@ -929,6 +968,40 @@ PY
                 self._cached_pose = pose
                 self._pose_last_fetch = time.time()
         return pose
+
+    def get_cached_pose(self, max_age: Optional[float] = 5.0) -> Optional[Dict[str, float]]:
+        """Return only the UDP-cached pose; never blocks on a Docker command."""
+        with self._pose_lock:
+            if not self._cached_pose:
+                return None
+            age = time.time() - self._pose_last_fetch
+            if max_age is not None and age > max(0.1, float(max_age)):
+                return None
+            pose = dict(self._cached_pose)
+            pose["age"] = round(age, 3)
+            return pose
+
+    def get_mobile_state(self) -> Dict:
+        # AMCL commonly publishes only while its estimate changes. Keep the
+        # last valid pose visible when the robot is stationary.
+        pose = self.get_cached_pose(max_age=None)
+        if pose is None:
+            return {"localized": False, "frame": "map"}
+        with self._goal_lock:
+            goal = dict(self._navigation_goal) if self._navigation_goal else None
+        return {
+            "localized": True,
+            "frame": "map",
+            "x": float(pose["x"]),
+            "y": float(pose["y"]),
+            "yaw": float(pose.get("yaw", 0.0)),
+            "pose_age": pose.get("age", 0.0),
+            "navigation_goal": goal,
+        }
+
+    def clear_navigation_goal(self):
+        with self._goal_lock:
+            self._navigation_goal = None
 
     def distance_to(self, x: float, y: float) -> Optional[float]:
         """Instant distance from cached pose — no Docker call."""
@@ -1015,3 +1088,71 @@ print(json.dumps(points))
         except Exception as e:
             print(f"[ROBOT MAP ERROR]: {e}", flush=True)
             return []
+
+    def get_map_snapshot(self, map_name="salle_robotique", force=False) -> Optional[Dict]:
+        """Return a PNG map plus ROS map metadata for mobile rendering."""
+        map_name = str(map_name or "salle_robotique")
+        with self._map_cache_lock:
+            if not force and map_name in self._map_cache:
+                return dict(self._map_cache[map_name])
+
+        script = r'''
+import base64, hashlib, json, os, re
+import cv2
+
+name = __MAP_NAME__
+folder = "/root/yahboomcar_ws/src/yahboomcar_nav/maps"
+yaml_path = os.path.join(folder, name + ".yaml")
+if not os.path.isfile(yaml_path):
+    print("{}"); raise SystemExit(0)
+
+text = open(yaml_path, "r").read()
+def value(key, default):
+    match = re.search(r"^" + re.escape(key) + r"\s*:\s*(.+)$", text, re.M)
+    return match.group(1).strip() if match else default
+
+resolution = float(value("resolution", "0.05"))
+origin_values = [float(v) for v in re.findall(r"[-+]?\d*\.?\d+", value("origin", "[0,0,0]"))]
+while len(origin_values) < 3:
+    origin_values.append(0.0)
+image_name = value("image", name + ".pgm").strip("\"'")
+image_path = image_name if os.path.isabs(image_name) else os.path.join(folder, image_name)
+image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+if image is None:
+    print("{}"); raise SystemExit(0)
+ok, encoded = cv2.imencode(".png", image, [int(cv2.IMWRITE_PNG_COMPRESSION), 7])
+if not ok:
+    print("{}"); raise SystemExit(0)
+raw = encoded.tobytes()
+height, width = image.shape[:2]
+print(json.dumps({
+    "map_id": hashlib.sha256(raw).hexdigest()[:16],
+    "name": name,
+    "encoding": "png_base64",
+    "image_base64": base64.b64encode(raw).decode("ascii"),
+    "width": int(width),
+    "height": int(height),
+    "resolution": resolution,
+    "origin_x": origin_values[0],
+    "origin_y": origin_values[1],
+    "origin_yaw": origin_values[2],
+    "frame": "map"
+}, separators=(",", ":")))
+'''.replace("__MAP_NAME__", json.dumps(map_name))
+
+        out = self._docker_ros("python3 - << 'PY'\n" + script + "\nPY\n", timeout=15)
+        try:
+            snapshot = json.loads(out.splitlines()[-1])
+        except Exception as exc:
+            print(f"[ROBOT MAP ERROR] mobile map export failed: {exc}", flush=True)
+            return None
+        if not snapshot or not snapshot.get("image_base64"):
+            return None
+        with self._map_cache_lock:
+            self._map_cache[map_name] = dict(snapshot)
+        print(
+            f"[ROBOT MAP] mobile snapshot {snapshot['width']}x{snapshot['height']} "
+            f"id={snapshot['map_id']}",
+            flush=True,
+        )
+        return snapshot
