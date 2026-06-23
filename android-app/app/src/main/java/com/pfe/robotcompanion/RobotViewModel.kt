@@ -137,6 +137,25 @@ class RobotViewModel(application: Application) : AndroidViewModel(application),
 
     fun requestMap() = webSocketClient.requestMap()
 
+    fun setRobotMicEnabled(enabled: Boolean) {
+        if (_uiState.value.connection != ConnectionState.CONNECTED) return
+        _uiState.update {
+            it.copy(
+                robotMicEnabled = enabled,
+                speechMode = if (enabled) "Robot microphone enabled" else "Robot microphone muted",
+            )
+        }
+        val result = webSocketClient.sendRobotMic(enabled)
+        if (!result.sent) {
+            _uiState.update {
+                it.copy(
+                    robotMicEnabled = !enabled,
+                    speechMode = "Could not update robot microphone; reconnect and try again",
+                )
+            }
+        }
+    }
+
     fun startSpeech() {
         val state = _uiState.value
         _uiState.update { it.copy(speechMode = "Starting speech recognition...") }
@@ -244,6 +263,15 @@ class RobotViewModel(application: Application) : AndroidViewModel(application),
             text = text,
             state = state,
         ))
+    }
+
+    override fun onRobotMic(enabled: Boolean) {
+        _uiState.update {
+            it.copy(
+                robotMicEnabled = enabled,
+                speechMode = if (enabled) "Robot microphone enabled" else "Robot microphone muted",
+            )
+        }
     }
 
     override fun onError(requestId: String, code: String, message: String) {

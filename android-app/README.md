@@ -43,8 +43,10 @@ Android 17 and later it also requests local-network permission.
 The connected experience has three bottom tabs: **Map**, **Conversation**, and
 **Control**. Conversation uses chat bubbles with fixed voice/text input. Control
 contains a persisted `20%` to `100%` speed slider, hold-to-drive buttons and
-voice parameters. A global red STOP action stays fixed in the top bar on every
-tab.
+voice parameters, including a switch for the robot's physical Jetson microphone.
+That robot microphone is muted by default and should be enabled only when you
+want the robot to listen from its own microphone. A global red STOP action stays
+fixed in the top bar on every tab.
 
 Manual movement is dead-man controlled: press and hold Forward, Reverse, Turn
 left or Turn right, then release to stop. The map supports bounded `1x` to `6x`

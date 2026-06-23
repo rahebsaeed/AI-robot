@@ -9,7 +9,7 @@ Key fixes:
  5. LLM response is printed as a clean string, not a dict repr
 """
 
-import os, sys, json, re, cv2, time, signal, subprocess, socket, threading
+import os, sys, json, re, cv2, time, signal, subprocess, socket, threading, math
 from core.brain import Brain
 from core.perceptions import Perceptions
 from core.robot import Robot
@@ -312,6 +312,259 @@ def is_list_places_request(command: str) -> bool:
         "show saved places",
     ])
 
+def is_places_count_request(command: str) -> bool:
+    t = command.lower().strip()
+    return any(p in t for p in [
+        "how many places",
+        "how many saved places",
+        "how many locations",
+        "how many locations do you remember",
+        "how many places do you remember",
+        "how many places are in your memory",
+        "count the places",
+        "count saved places",
+    ])
+
+def is_map_name_request(command: str) -> bool:
+    t = normalize_user_text(command)
+    if "map" not in t:
+        return False
+    return bool(
+        re.search(r"\bwhat'?s\s+(?:the\s+)?(?:name\s+of\s+)?(?:this\s+|current\s+)?map\b", t)
+        or re.search(r"\bwhat\s+is\s+(?:the\s+)?(?:name\s+of\s+)?(?:this\s+|current\s+)?map\b", t)
+        or re.search(r"\bwhich\s+(?:is\s+)?(?:this\s+|current\s+)?map\b", t)
+        or re.fullmatch(r"(?:this\s+|current\s+)?map\s+name", t)
+        or re.fullmatch(r"(?:which|what)\s+(?:this\s+)?map", t)
+    )
+
+def describe_map_identity(map_name: str, places_memory: PlacesMemory) -> str:
+    names = places_memory.list_places(map_name)
+    if not names:
+        return f"The current map is named {map_name}. I do not have saved places on it yet."
+    return (
+        f"The current map is named {map_name}. "
+        f"I know {len(names)} saved place{'s' if len(names) != 1 else ''} on it: {', '.join(names)}."
+    )
+
+def is_current_place_request(command: str) -> bool:
+    t = normalize_user_text(command)
+    phrases = [
+        "define your place",
+        "define this place",
+        "define your position",
+        "what is this place",
+        "what place is this",
+        "which place is this",
+        "which place are you",
+        "what is your place",
+        "what is your current place",
+        "do you know this position",
+        "you know this position",
+        "know this position where you are",
+        "is this a saved place",
+        "am i at a saved place",
+    ]
+    return any(p in t for p in phrases)
+
+def current_pose_for_facts(robot: Robot):
+    state = robot.get_mobile_state()
+    if state.get("localized"):
+        return {
+            "x": float(state.get("x", 0.0)),
+            "y": float(state.get("y", 0.0)),
+            "yaw": float(state.get("yaw", 0.0)),
+            "age": float(state.get("pose_age", 0.0)),
+        }
+    try:
+        pose = robot.get_amcl_pose()
+    except Exception:
+        pose = None
+    if pose:
+        return {
+            "x": float(pose.get("x", 0.0)),
+            "y": float(pose.get("y", 0.0)),
+            "yaw": float(pose.get("yaw", 0.0)),
+            "age": 0.0,
+        }
+    return None
+
+def nearest_saved_place(map_name: str, places_memory: PlacesMemory, pose: dict):
+    best = None
+    for name in places_memory.list_places(map_name):
+        place = places_memory.get_place(map_name, name)
+        if not place:
+            continue
+        dist = math.hypot(float(place["x"]) - pose["x"], float(place["y"]) - pose["y"])
+        if best is None or dist < best[2]:
+            best = (name, place, dist)
+    return best
+
+def describe_current_place(robot: Robot, map_name: str, places_memory: PlacesMemory) -> str:
+    pose = current_pose_for_facts(robot)
+    names = places_memory.list_places(map_name)
+    if pose is None:
+        if names:
+            return (
+                f"I know the map {map_name}, with saved places: {', '.join(names)}. "
+                "My AMCL pose is not ready yet, so I cannot match this exact position."
+            )
+        return f"I know the map {map_name}, but my AMCL pose is not ready yet."
+
+    if not names:
+        return (
+            f"I am on map {map_name} at x={pose['x']:.2f}, y={pose['y']:.2f}. "
+            "There are no saved places on this map yet."
+        )
+
+    nearest = nearest_saved_place(map_name, places_memory, pose)
+    if nearest is None:
+        return (
+            f"I am on map {map_name} at x={pose['x']:.2f}, y={pose['y']:.2f}. "
+            "There are no valid saved places to compare with."
+        )
+    name, _place, dist = nearest
+    match_radius = float(os.environ.get("AI_PLACE_MATCH_RADIUS", "0.80"))
+    if dist <= match_radius:
+        return (
+            f"This position is {name} on map {map_name}. "
+            f"My pose is x={pose['x']:.2f}, y={pose['y']:.2f}, about {dist:.2f} m from that saved place."
+        )
+    return (
+        f"I am on map {map_name} at x={pose['x']:.2f}, y={pose['y']:.2f}. "
+        f"The closest saved place is {name}, about {dist:.2f} m away, so I am not exactly at a saved place."
+    )
+
+def normalize_user_text(command: str) -> str:
+    t = re.sub(r"[?.!,]", " ", str(command).lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+def is_question_like(command: str) -> bool:
+    t = normalize_user_text(command)
+    return bool(
+        re.search(r"\b(what|where|who|when|why|how|which|can|could|do|does|did|is|are)\b", t)
+        or t.endswith("?")
+    )
+
+def is_robot_pose_request(command: str) -> bool:
+    t = normalize_user_text(command)
+    self_terms = r"(?:you|u|yourself|your|robot|the robot)"
+    return bool(
+        re.search(rf"\bwhere\s+(?:are|r|is)\s+{self_terms}\b", t)
+        or re.search(r"\bwhat\s+is\s+(?:your|the\s+robot(?:'s)?)\s+(?:position|location|pose)\b", t)
+        or re.search(r"\b(?:tell|show|give)\s+me\s+(?:your|the\s+robot(?:'s)?|robot)\s+(?:position|location|pose)\b", t)
+        or re.fullmatch(r"(?:robot\s+)?(?:position|location|pose)", t)
+    )
+
+def describe_robot_pose(robot: Robot, map_name: str) -> str:
+    pose = current_pose_for_facts(robot)
+    state = robot.get_mobile_state()
+    if pose is None:
+        return "I do not have a valid AMCL position yet."
+    x = float(pose.get("x", 0.0))
+    y = float(pose.get("y", 0.0))
+    yaw = float(pose.get("yaw", 0.0))
+    heading = int(round(math.degrees(yaw)))
+    pose_age = float(pose.get("age", 0.0))
+    speech = (
+        f"I am on map {map_name} at x={x:.2f}, y={y:.2f}, "
+        f"heading {heading} degrees."
+    )
+    if pose_age > 60.0:
+        speech += f" This is my last known pose from {pose_age:.0f} seconds ago."
+    goal = state.get("navigation_goal")
+    if isinstance(goal, dict):
+        speech += f" My active navigation goal is x={float(goal.get('x', 0.0)):.2f}, y={float(goal.get('y', 0.0)):.2f}."
+    return speech
+
+def is_current_vision_request(command: str) -> bool:
+    t = normalize_user_text(command)
+    asks_search_location = bool(
+        re.search(r"\b(where\s+(?:is|are)|locate|find|search|look\s+for|go\s+to)\b", t)
+    )
+    asks_current_view = any(p in t for p in [
+        "camera",
+        "current view",
+        "right now",
+        "visible",
+        "see",
+        "detect",
+        "around you",
+        "in front of you",
+    ])
+    if asks_search_location and not asks_current_view:
+        return False
+    if any(p in t for p in [
+        "what do you see",
+        "what can you see",
+        "what you see",
+        "describe camera",
+        "describe what you see",
+        "camera view",
+        "around you",
+        "in front of you",
+    ]):
+        return True
+    if not is_question_like(command):
+        return False
+    physical_terms = {
+        "door", "bottle", "chair", "table", "person", "human", "cup", "bag",
+        "suitcase", "box", "wall", "room", "object", "thing", "purple",
+        "red", "blue", "green", "yellow", "black", "white", "left", "right",
+        "front", "behind", "camera", "see", "visible", "detect",
+    }
+    return (
+        bool(re.search(r"\b(what|where|is|are|do|does|can|could|see|detect)\b", t))
+        and any(term in t for term in physical_terms)
+    )
+
+def describe_current_vision(command: str, vision_desc: str, objects: list) -> str:
+    if objects:
+        return vision_desc
+    t = command.lower()
+    target_match = re.search(r"\b(?:the\s+)?([a-z][a-z0-9 _-]{1,30})\b", t)
+    if "door" in t:
+        return "I do not see a door in the current camera view. I can search the map for the door if you ask me to search for it."
+    if target_match and not any(p in t for p in ["what do you see", "what can you see", "camera"]):
+        return f"{vision_desc} I do not see that target in the current camera view."
+    return vision_desc
+
+def build_brain_context(map_name: str, robot: Robot, places_memory: PlacesMemory,
+                        vision_desc: str, lidar_distance, objects: list) -> dict:
+    state = robot.get_mobile_state()
+    pose = "not localized"
+    if state.get("localized"):
+        pose = (
+            f"x={float(state.get('x', 0.0)):.2f}, "
+            f"y={float(state.get('y', 0.0)):.2f}, "
+            f"yaw={math.degrees(float(state.get('yaw', 0.0))):.0f}deg, "
+            f"age={float(state.get('pose_age', 0.0)):.1f}s"
+        )
+    goal = state.get("navigation_goal")
+    goal_text = ""
+    if isinstance(goal, dict):
+        goal_text = f"x={float(goal.get('x', 0.0)):.2f}, y={float(goal.get('y', 0.0)):.2f}"
+    names = places_memory.list_places(map_name)
+    if names:
+        saved_places = f"{len(names)}: {', '.join(names[:8])}"
+        if len(names) > 8:
+            saved_places += ", ..."
+    else:
+        saved_places = "none"
+    lidar_text = f"{float(lidar_distance):.2f}m front" if lidar_distance is not None else "unknown"
+    object_names = ", ".join(
+        f"{o.get('name', '?')}@{o.get('position', '?')}"
+        for o in (objects or [])[:5]
+    ) or "none"
+    return {
+        "map": map_name,
+        "pose": pose,
+        "navigation_goal": goal_text,
+        "saved_places": saved_places,
+        "vision": f"{vision_desc} objects={object_names}",
+        "lidar": lidar_text,
+        "status": "Use this context for robot questions; do not claim sensors are unavailable.",
+    }
+
 def get_lidar_distance(perceptions):
     try:
         if hasattr(perceptions, "get_lidar_distance"):
@@ -377,7 +630,9 @@ def detect_arm_intent(command):
 def normalize_model_data(data):
     if not isinstance(data, dict):
         data = {}
-    speech  = str(data.get("speech", "I am ready."))
+    speech = str(data.get("speech", "")).strip()
+    if not speech:
+        speech = "I am ready."
     thought = str(data.get("thought", ""))
     action  = data.get("action", {}) if isinstance(data.get("action"), dict) else {}
 
@@ -415,7 +670,8 @@ def build_safe_action(command, model_data, vision_data, lidar_distance):
 
     if move != "stop" and not is_imperative_motion(command):
         move, speed = "stop", 0.0
-        data["speech"] = "I am ready."
+        if not str(data.get("speech", "")).strip():
+            data["speech"] = "I am ready."
 
     if move_intent == "forward":
         move, speed = "forward", DEFAULT_FORWARD_SPEED
@@ -441,6 +697,8 @@ def build_safe_action(command, model_data, vision_data, lidar_distance):
 
     if arm_intent:
         arm = arm_intent
+    else:
+        arm = "home"
 
     # Lidar forward guard
     if move == "forward":
@@ -570,14 +828,23 @@ def main():
                 )
         threading.Thread(target=_launch, daemon=True).start()
 
+    def set_robot_microphone(enabled: bool, request_id="", source="interface"):
+        enabled = bool(enabled)
+        perceptions.set_mute(not enabled)
+        print(f"[ROBOT MIC] source={source} enabled={enabled}", flush=True)
+        if mobile_gateway is not None:
+            mobile_gateway.publish_robot_mic_state(enabled, source=source)
+
     mobile_gateway = MobileGateway(
         command_bus=command_bus,
-        map_provider=lambda: robot.get_map_snapshot(map_name),
+        map_provider=lambda: robot.get_map_snapshot(map_name, force=True),
         telemetry_provider=robot.get_mobile_state,
         stop_callback=stop_all,
         search_cancel_callback=cancel_search,
         teleop_callback=mobile_control.update,
         rviz_callback=show_rviz,
+        mic_control_callback=set_robot_microphone,
+        mic_state_provider=lambda: not perceptions.is_muted,
     )
     face.add_listener(mobile_gateway.broadcast_event)
     mobile_gateway.start()
@@ -617,6 +884,10 @@ def main():
             lidar_distance     = get_lidar_distance(perceptions)
             objects            = get_objects_from_vision(vision_data)
             vision_desc        = get_vision_description(vision_data)
+            brain_context      = build_brain_context(
+                map_name, robot, places_memory, vision_desc,
+                lidar_distance, objects,
+            )
 
             command = envelope.text
             command_generation = current_operation_generation()
@@ -636,7 +907,7 @@ def main():
                     places_memory.save_place(map_name, save_target, pose["x"], pose["y"], pose["yaw"])
                     speech = f"Location saved as {save_target}."
                     print(f"[PLACES MEMORY] Saved place '{save_target}' at x={pose['x']:.2f}, y={pose['y']:.2f}, yaw={pose['yaw']:.2f}", flush=True)
-                
+
                 deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
                 continue
 
@@ -671,6 +942,44 @@ def main():
                 deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
                 continue
 
+            # 5. Count places in memory
+            if is_places_count_request(command):
+                names = places_memory.list_places(map_name)
+                count = len(names)
+                if count == 0:
+                    speech = "I do not have any saved places for this map yet."
+                elif count == 1:
+                    speech = f"I have 1 saved place on this map: {names[0]}."
+                else:
+                    speech = f"I have {count} saved places on this map: {', '.join(names)}."
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
+                continue
+
+            # 6. Exact map identity questions must not depend on the LLM.
+            if is_map_name_request(command):
+                speech = describe_map_identity(map_name, places_memory)
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
+                continue
+
+            # 7. Current named-place questions compare AMCL pose to saved places.
+            if is_current_place_request(command):
+                speech = describe_current_place(robot, map_name, places_memory)
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
+                continue
+
+            # 8. Robot position/status questions must not become a search for "you".
+            if is_robot_pose_request(command):
+                speech = describe_robot_pose(robot, map_name)
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
+                continue
+
+            # 9. Camera/vision questions should answer from live sensor data, not
+            # from the general language model.
+            if is_current_vision_request(command):
+                speech = describe_current_vision(command, vision_desc, objects)
+                deliver_response(perceptions, face, mobile_gateway, envelope, command, speech)
+                continue
+
             # ── SEARCH REQUEST ─────────────────────────────────
             if is_search_request(command):
                 target = parse_search_target(command)
@@ -682,7 +991,7 @@ def main():
                     speech_start = f"I am going to {target}."
                     perceptions.speak(speech_start)
                     face.send_message(f"You: {command}\nAI: {speech_start}")
-                    
+
                     face_show_search(
                         face, target, "starting", 0, 0, objects,
                         message=speech_start, can_talk=False
@@ -696,12 +1005,12 @@ def main():
                             status="cancelled",
                         )
                         continue
-                    
+
                     robot.cancel_navigation()
                     robot.stop()
                     if hasattr(robot, "clear_costmaps"):
                         robot.clear_costmaps()
-                        
+
                     goal_started = robot.goto_map(saved_place["x"], saved_place["y"], saved_place["yaw"])
                     if not goal_started:
                         if command_generation != current_operation_generation():
@@ -722,7 +1031,7 @@ def main():
                             message=speech, can_talk=True
                         )
                         continue
-                        
+
                     t_start = time.time()
                     nav_timeout = 35.0
                     arrived = False
@@ -731,11 +1040,11 @@ def main():
                     last_progress = time.time()
                     best_d = None
                     progress_thresh = 0.10
-                    
+
                     try:
                         if hasattr(perceptions, "set_moving"):
                             perceptions.set_moving(True)
-                            
+
                         while time.time() - t_start < nav_timeout:
                             if command_generation != current_operation_generation():
                                 interrupted = True
@@ -747,14 +1056,14 @@ def main():
                                 if d <= 0.45:
                                     arrived = True
                                     break
-                                    
+
                                 if best_d is None or d < best_d - progress_thresh:
                                     best_d = d
                                     last_progress = time.time()
                                 elif time.time() - last_progress > stuck_timeout:
                                     print("[NAV STUCK] Stuck navigating to place", flush=True)
                                     break
-                                    
+
                             face.send_status({
                                 "mode": "searching",
                                 "target": target,
@@ -776,7 +1085,7 @@ def main():
 
                     if interrupted:
                         robot.cancel_navigation()
-                        
+
                     if interrupted:
                         speech = f"Navigation to {target} was cancelled."
                         phase = "cancelled"
@@ -789,7 +1098,7 @@ def main():
                         speech = f"I failed to navigate to {target}."
                         phase = "not_found"
                         found = False
-                        
+
                     print(f"[TASK RESULT]: arrived={arrived} speech={speech}", flush=True)
                     deliver_response(
                         perceptions, face, mobile_gateway, envelope, command, speech,
@@ -880,6 +1189,7 @@ def main():
                 command,
                 vision_data=vision_data,
                 lidar_distance=lidar_distance,
+                robot_context=brain_context,
             )
 
             # raw_response is always a dict from the upgraded brain

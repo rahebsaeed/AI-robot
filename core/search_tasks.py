@@ -73,7 +73,8 @@ def resolve_yolo_name(target_text: str) -> Optional[str]:
 # ── Noise words that indicate a mis-hear, not a real object ──────
 _NON_SEARCHABLE = {
     "map","floor","wall","room","area","place","space","the","a","an",
-    "here","there","somewhere","thing","stuff","object","it",
+    "here","there","somewhere","thing","stuff","object","it","you","u",
+    "me","myself","yourself","robot",
 }
 
 def is_searchable_target(text: str) -> bool:
@@ -101,6 +102,10 @@ def normalize_command_text(text: str) -> str:
 
 def is_search_request(text: str) -> bool:
     t = normalize_command_text(text)
+    if re.search(r"\bwhere\s+(?:are|r)\s+(?:you|u|the robot)\b", t):
+        return False
+    if re.search(r"\bwhat\s+is\s+(?:your|the robot(?:'s)?)\s+(?:position|location|pose)\b", t):
+        return False
     return any(p in t for p in [
         "search for","look for","find","where is","where are",
         "locate","go find","go to","can you find","please find",
@@ -114,14 +119,19 @@ def parse_search_target(text: str) -> str:
                "go find","find","where is","where are","locate","go to",
                "the ","a ","an "]:
         t = t.replace(rm, " ")
-    return re.sub(r"\s+", " ", t).strip() or "object"
+    tokens = [tok for tok in re.sub(r"\s+", " ", t).strip().split(" ") if tok]
+    while tokens and (len(tokens[0]) == 1 or tokens[0] in {"the", "a", "an", "this", "that", "please", "robot"}):
+        tokens.pop(0)
+    return " ".join(tokens).strip() or "object"
 
 # ── Main search task ─────────────────────────────────────────────
 
 class MapSearchTask:
     VISIT_RADIUS   = 0.60   # m — don't revisit same spot
     NAV_TIMEOUT    = float(os.environ.get("AI_SEARCH_NAV_TIMEOUT", "14.0"))
-    STUCK_TIMEOUT  = float(os.environ.get("AI_SEARCH_STUCK_TIMEOUT", "3.0"))
+    STUCK_TIMEOUT  = float(os.environ.get("AI_SEARCH_STUCK_TIMEOUT", "8.0"))
+    START_GRACE_SECONDS = float(os.environ.get("AI_SEARCH_START_GRACE_SECONDS", "5.0"))
+    MAX_STUCK_GOALS = int(os.environ.get("AI_SEARCH_MAX_STUCK_GOALS", "4"))
     PROGRESS_THRESH= 0.10   # m improvement to reset stuck timer
     SCAN_DWELL     = 0.7    # s dwell per scan direction
     CONFIRM_READS  = int(os.environ.get("AI_SEARCH_CONFIRM_READS", "1"))
@@ -584,7 +594,7 @@ class MapSearchTask:
         # during the search; when these points are exhausted, the map is done.
         spacing = float(os.environ.get("AI_SEARCH_SPACING_M", "1.00"))
         max_points = int(os.environ.get("AI_SEARCH_MAX_POINTS", "90"))
-        clearance = float(os.environ.get("AI_SEARCH_CLEARANCE_M", "0.50"))
+        clearance = float(os.environ.get("AI_SEARCH_CLEARANCE_M", "0.65"))
         all_waypoints = self.robot.get_search_waypoints(
             self.map_name, spacing_m=spacing, max_points=max_points,
             clearance_m=clearance,
@@ -616,6 +626,7 @@ class MapSearchTask:
 
         # 4. Exhaustive map search using Nearest Neighbor routing.
         consecutive_nav_failures = 0
+        consecutive_stuck_goals = 0
         while True:
             if self.is_cancel_requested():
                 return self._cancelled_result(target_text)
@@ -723,7 +734,10 @@ class MapSearchTask:
                             best_d        = d
                             last_progress = time.time()
                             made_progress = True
-                        elif time.time() - last_progress > self.STUCK_TIMEOUT:
+                        elif (
+                            time.time() - t_start >= self.START_GRACE_SECONDS
+                            and time.time() - last_progress > self.STUCK_TIMEOUT
+                        ):
                             if recovery_count >= self.MAX_RECOVERIES_PER_WP:
                                 print("[SEARCH] waypoint stuck — skipping without stopping search", flush=True)
                                 self._emit_status(
@@ -755,10 +769,34 @@ class MapSearchTask:
                     self.perceptions.set_moving(False)
 
             if arrived:
+                consecutive_stuck_goals = 0
                 self._mark_visited(wp, scanned=False, note="drive-by")
                 continue
 
             if stuck_or_timeout and not self.STOP_AT_WAYPOINT:
+                try:
+                    self.robot.cancel_navigation()
+                    self.robot.stop()
+                except Exception:
+                    pass
+                if made_progress:
+                    consecutive_stuck_goals = 0
+                else:
+                    consecutive_stuck_goals += 1
+                    if consecutive_stuck_goals >= self.MAX_STUCK_GOALS:
+                        msg = (
+                            f"I could not make navigation progress after {consecutive_stuck_goals} goals. "
+                            "The map search is stopped so the robot does not keep sending unreachable goals. "
+                            "Check that move_base is publishing /cmd_vel and that AMCL pose is updating."
+                        )
+                        print(f"[SEARCH NAV ERROR] {msg}", flush=True)
+                        self._emit_status(
+                            target_text, "navigation_failed", overall_idx, self._total_waypoints,
+                            found=False, message=msg, force=True, mode="not_found", can_talk=True
+                        )
+                        return {"found": False, "speech": msg, "where": "navigation failed"}
+                    if consecutive_stuck_goals % 2 == 0 and hasattr(self.robot, "clear_costmaps"):
+                        self.robot.clear_costmaps()
                 self._mark_visited(wp, scanned=False, note="navigation-stuck")
                 continue
 

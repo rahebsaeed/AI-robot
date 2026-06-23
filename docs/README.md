@@ -423,7 +423,7 @@ export AI_SEARCH_MAX_RECOVERIES_PER_WP=1
 | `AI_SEARCH_ROTATE_ON_STUCK` | `0` | Rotate left when stuck. Disabled by default. |
 | `AI_SEARCH_SPACING_M` | `1.00` | Distance between generated search waypoints. |
 | `AI_SEARCH_MAX_POINTS` | `90` | Maximum generated search waypoints. |
-| `AI_SEARCH_CLEARANCE_M` | `0.50` | Minimum clearance from walls/obstacles in map waypoint generation. |
+| `AI_SEARCH_CLEARANCE_M` | `0.65` | Minimum clearance from walls/obstacles in map waypoint generation. |
 
 ## 12. Waypoint Generation
 
@@ -493,8 +493,8 @@ CTRL+C in `start_navigation.sh` runs `cleanup()`:
 1. Stop host AI and face interface.
 2. Save a converged AMCL pose for the next startup.
 3. Stop robot motion and stale `/cmd_vel` publishers.
-4. Stop lidar motor and lidar ROS drivers.
-5. Save the map using `map_saver`.
+4. Save a live SLAM map if `/map` is being published by a mapper.
+5. Stop lidar motor and lidar ROS drivers.
 6. Stop AI bridges and RViz.
 7. Stop ROS nodes and roscore.
 8. Restore terminal state.
@@ -504,6 +504,12 @@ Map saving can be disabled:
 ```bash
 export AI_SAVE_MAP_ON_EXIT=0
 ```
+
+Normal AMCL navigation reads a static map from `map_server`; it does not update
+the occupancy grid. On shutdown, `start_navigation.sh` now skips map saving when
+`/map` is static and prints the reason. Use `auto_scan.sh MAP_NAME` to update a
+saved occupancy map. Set `AI_SAVE_STATIC_MAP_ON_EXIT=1` only when you explicitly
+want to re-save the unchanged static map.
 
 ## 16. Safety Rules
 
@@ -524,7 +530,9 @@ The system protects movement by:
 | `[SEARCH] wp 3/18 ...` | Search is navigating to waypoint 3 of 18. |
 | `[SEARCH] live target hit while navigating` | YOLO saw the target during movement. |
 | `[SEARCH] waypoint stuck - skipping without stopping search` | Waypoint did not make progress and was skipped. |
-| `[ROBOT NAV]: simple goal sent OK` | move_base goal was published successfully. |
+| `[SEARCH NAV ERROR] ... no navigation progress ...` | Several goals produced no AMCL progress; check `move_base`, `/cmd_vel`, AMCL pose updates and costmaps. |
+| `[ROBOT NAV]: move_base action goal sent OK` | move_base accepted an action goal. If the robot still does not move, inspect `/cmd_vel`, costmaps and AMCL progress. |
+| `[STT] Robot microphone starts MUTED` | The Jetson microphone is muted until enabled from the Android Control tab or `AI_ROBOT_MIC_DEFAULT_MUTED=0`. |
 | `[CAMERA] 320x240 frames=...` | Host camera UDP receiver is receiving frames. |
 | `[LIDAR] UDP listener on :5010` | Host lidar UDP receiver is active. |
 | `[POSE BRIDGE] Started /amcl_pose` | Docker pose bridge is sending AMCL pose to host. |
@@ -542,6 +550,23 @@ export AI_SEARCH_START_SCAN_SECONDS=0
 export AI_SEARCH_FULL_SCAN_EVERY=0
 export AI_SEARCH_ROTATE_ON_STUCK=0
 export AI_SEARCH_MAX_RECOVERIES_PER_WP=0
+```
+
+Search navigation waits longer before declaring a waypoint stuck:
+
+```bash
+export AI_SEARCH_START_GRACE_SECONDS=5.0
+export AI_SEARCH_STUCK_TIMEOUT=8.0
+export AI_SEARCH_MAX_STUCK_GOALS=4
+```
+
+The physical Jetson microphone is muted by default so background speech and
+motor noise do not create false commands during navigation. Enable it from the
+Android Control tab only when needed, or override startup behavior:
+
+```bash
+export AI_ROBOT_MIC_DEFAULT_MUTED=0
+export AI_MIC_LISTEN_WHILE_MOVING=1
 ```
 
 ### Object is visible but not found
@@ -591,7 +616,79 @@ If the robot starts at a fixed location, set `AI_AMCL_INITIAL_X`,
 `AI_AMCL_INITIAL_Y`, and `AI_AMCL_INITIAL_YAW` once. A clean shutdown then
 persists the converged pose for later starts.
 
-## 19. Typical Commands
+## 19. Professional Automatic Mapping
+
+`auto_scan.sh` uses the same Yahboom bringup and gmapping launch files as the
+working keyboard scanner, then starts `tools/professional_explorer.py` instead
+of `explore_lite`.
+
+```bash
+./auto_scan.sh salle_robotique
+```
+
+The coordinator:
+
+1. Detects connected free/unknown frontier boundaries.
+2. Splits long boundaries into multiple spaced exploration regions.
+3. Uses `move_base` when its action server is available. If the Yahboom mapping
+   stack exposes no action server, it builds collision-inflated grid routes with
+   an internal A* planner and follows them using TF pose feedback and live LiDAR
+   front/left/right safety sectors.
+4. Stores visited goals, failed goals, and sampled robot positions in
+   `/root/yahboomcar_ws/src/yahboomcar_nav/maps/.MAP_exploration.json`.
+5. Rejects fake near goals that are already inside tolerance, then uses a short
+   LiDAR-guarded forward probe to expand the map before selecting another goal.
+6. Confirms that no reachable unvisited frontier remains, saves the map, stops
+   ROS safely, and exits automatically.
+
+CTRL+C saves a valid partial map. Running `auto_scan.sh MAP_NAME` again backs up
+and removes the existing `.yaml`, `.pgm`, and exploration memory first, then
+creates a fresh map with the same name. The previous map is kept as a hidden
+timestamped backup in the maps folder. To keep the old files in place, run with
+`AUTO_SCAN_KEEP_EXISTING=1`. To skip maps that are already marked complete:
+
+```bash
+AUTO_SCAN_SKIP_COMPLETED=1 ./auto_scan.sh salle_robotique
+```
+
+Gmapping cannot load a saved occupancy image as a resumable SLAM state. For
+that reason, incomplete memory is reset when the script starts a new gmapping
+session. `AUTO_SCAN_REUSE_MEMORY=1` is only appropriate when restarting the
+coordinator inside the same unchanged map/odometry frame.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `AUTO_SCAN_MIN_FRONTIER_LENGTH` | `0.35` | Minimum frontier boundary length in metres. |
+| `AUTO_SCAN_MIN_CLEARANCE` | `0.35` | Minimum goal clearance from mapped obstacles. |
+| `AUTO_SCAN_VISITED_RADIUS` | `0.85` | Radius used to suppress already-scanned goals. |
+| `AUTO_SCAN_PLAN_CANDIDATES` | `6` | Highest-utility candidates checked by the available service or internal A*. |
+| `AUTO_SCAN_GOAL_TIMEOUT` | `60` | Maximum seconds for one navigation goal. |
+| `AUTO_SCAN_PROGRESS_TIMEOUT` | `15` | Seconds without distance progress before abandoning a goal. |
+| `AUTO_SCAN_MIN_GOAL_DISTANCE` | `0.10` | Minimum normal frontier travel distance; small values allow fresh maps to start moving. |
+| `AUTO_SCAN_MIN_NEAR_GOAL_DISTANCE` | `0.05` | Minimum close-frontier distance accepted during startup expansion. |
+| `AUTO_SCAN_MAX_LINEAR_SPEED` | `0.35` | Default direct A* and move_base linear exploration speed. |
+| `AUTO_SCAN_MAX_ANGULAR_SPEED` | `1.00` | Default direct A* and move_base angular exploration speed. |
+| `AUTO_SCAN_OBSTACLE_STOP_DISTANCE` | `0.55` | Live LiDAR front distance where direct A* stops driving forward. |
+| `AUTO_SCAN_OBSTACLE_SLOW_DISTANCE` | `0.90` | Live LiDAR front distance where direct A* starts slowing down. |
+| `AUTO_SCAN_COSTMAP_INFLATION_RADIUS` | `0.50` | move_base costmap inflation radius applied during auto-scan when move_base is available. |
+| `AUTO_SCAN_USE_MOVE_BASE` | `1` | Use move_base action navigation when available; set `0` to force internal A*. |
+| `AUTO_SCAN_REQUIRE_MOVE_BASE` | `1` | Stop instead of using slow internal navigation if move_base cannot start. Set `0` to allow fallback. |
+| `AUTO_SCAN_MOVE_BASE_WAIT` | `45` | Seconds to wait for the move_base action server before one restart attempt. |
+| `AUTO_SCAN_MOVE_BASE_RETRY_WAIT` | `45` | Seconds to wait after restarting move_base once. |
+| `AUTO_SCAN_KEEP_EXISTING` | `0` | Set `1` to keep existing map files before starting a new scan. |
+| `AUTO_SCAN_ALLOW_NEAR_GOALS` | `1` | Allows close startup frontiers so fresh maps do not stall before the first real travel goal. |
+| `AUTO_SCAN_POST_GOAL_SCAN_SECONDS` | `0.8` | Rotation scan after a successful travel goal. |
+| `AUTO_SCAN_RECOVERY_DRIVE_SECONDS` | `2.0` | Cautious forward probe duration when no far frontier is ready. |
+| `AUTO_SCAN_RECOVERY_DRIVE_SPEED` | `0.25` | Forward speed used during recovery probes. |
+| `AUTO_SCAN_RECOVERY_MIN_FRONT_CLEARANCE` | `0.75` | Required LiDAR front clearance before a recovery forward probe. |
+| `AUTO_SCAN_COMPLETION_CONFIRMATIONS` | `3` | Consecutive no-frontier checks required for completion once enough exploration evidence exists. |
+| `AUTO_SCAN_COMPLETION_CHECK_DELAY` | `1.0` | Seconds between no-frontier completion checks. |
+| `AUTO_SCAN_MAP_SETTLE_TIME` | `0.6` | Seconds to wait for gmapping to settle after each goal. |
+| `AUTO_SCAN_MAX_WEAK_EXPANSIONS` | `2` | Bounded recovery attempts before saving a weak/blocked small-room map. |
+| `AUTO_SCAN_MAX_RUNTIME` | `180` | Runtime limit in seconds for weak/blocked explorations; set `0` for unlimited. |
+| `AUTO_SCAN_MAX_GOALS` | `10` | Optional goal limit; zero is unlimited. |
+
+## 20. Typical Commands
 
 Start with default map:
 
@@ -629,7 +726,7 @@ Watch command bridge:
 docker exec -it yahboom_container /bin/bash -lc "tail -f /tmp/ai_cmd_vel_bridge.log"
 ```
 
-## 20. Design Principle
+## 21. Design Principle
 
 The stable search behavior should be:
 

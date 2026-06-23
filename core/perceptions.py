@@ -63,7 +63,8 @@ class Perceptions:
         self._last_robot_speech_end = 0.0
         self._speaking_event = threading.Event()
         self._speech_lock = threading.Lock()
-        self.is_muted = False
+        self.is_muted = os.environ.get("AI_ROBOT_MIC_DEFAULT_MUTED", "1").strip() != "0"
+        self._listen_while_moving = os.environ.get("AI_MIC_LISTEN_WHILE_MOVING", "0").strip() == "1"
         self._robot_moving = False
         self._search_target = None
         self._search_target_open_vocab = False
@@ -90,6 +91,7 @@ class Perceptions:
 
         self._start_lidar_listener()
         self._start_camera_listener()
+        print(f"[STT] Robot microphone starts {'MUTED' if self.is_muted else 'UNMUTED'}", flush=True)
 
         mics = sr.Microphone.list_microphone_names()
         print("Available Microphones:", mics, flush=True)
@@ -524,7 +526,11 @@ class Perceptions:
             time.sleep(remaining)
 
     def listen(self, timeout=5, phrase_time_limit=8):
-        if self.is_muted or self._speaking_event.is_set():
+        if (
+            self.is_muted
+            or self._speaking_event.is_set()
+            or (self._robot_moving and not self._listen_while_moving)
+        ):
             time.sleep(0.5)
             return None
 

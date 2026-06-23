@@ -22,6 +22,7 @@ class RobotWebSocketClient(private val listener: Listener) {
         fun onAcknowledged(requestId: String, state: String)
         fun onProcessing(requestId: String)
         fun onResponse(requestId: String, text: String, state: String, source: String)
+        fun onRobotMic(enabled: Boolean)
         fun onError(requestId: String, code: String, message: String)
     }
 
@@ -120,6 +121,17 @@ class RobotWebSocketClient(private val listener: Listener) {
             put("type", "map_request")
             put("request_id", UUID.randomUUID().toString())
         })
+    }
+
+    fun sendRobotMic(enabled: Boolean): SendResult {
+        val requestId = UUID.randomUUID().toString()
+        val sent = send(JSONObject().apply {
+            put("v", 1)
+            put("type", "robot_mic")
+            put("request_id", requestId)
+            put("enabled", enabled)
+        })
+        return SendResult(requestId, sent)
     }
 
     @Synchronized
@@ -249,6 +261,7 @@ class RobotWebSocketClient(private val listener: Listener) {
                 json.optString("status", "completed"),
                 json.optString("source", "robot"),
             )
+            "robot_mic" -> listener.onRobotMic(json.optBoolean("enabled", false))
             "error" -> listener.onError(
                 json.optString("request_id"),
                 json.optString("code", "ERROR"),

@@ -551,6 +551,17 @@ private fun ParametersCard(state: RobotUiState, viewModel: RobotViewModel) {
                 checked = state.endpoint.offlineSpeech,
                 onCheckedChange = viewModel::updateOfflineSpeech,
             )
+            HorizontalDivider()
+            SettingRow(
+                title = "Robot physical microphone",
+                subtitle = if (state.robotMicEnabled) {
+                    "Robot mic is listening until you turn it off"
+                } else {
+                    "Muted on the Jetson; use this only when needed"
+                },
+                checked = state.robotMicEnabled,
+                onCheckedChange = viewModel::setRobotMicEnabled,
+            )
             OutlinedTextField(
                 value = state.endpoint.locale,
                 onValueChange = viewModel::updateLocale,

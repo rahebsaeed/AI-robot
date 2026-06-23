@@ -128,11 +128,54 @@ save_map_on_exit() {
         return
     fi
 
-    echo "[MAP] Saving map: $MAP_NAME"
+    if [ "${AI_SAVE_STATIC_MAP_ON_EXIT:-0}" != "1" ]; then
+        if ! run_in_docker "rostopic info /map 2>/dev/null | grep -Eqi '/slam_gmapping|gmapping|cartographer|hector|rtabmap|slam_toolbox'"; then
+            echo "[MAP] /map is static navigation data, not live SLAM. Nothing new can be saved from start_navigation.sh."
+            echo "[MAP] Use ./auto_scan.sh $MAP_NAME to update the occupancy map. Set AI_SAVE_STATIC_MAP_ON_EXIT=1 only to force re-saving the static map."
+            return
+        fi
+    fi
+
+    echo "[MAP] Saving live map update: $MAP_NAME"
     run_in_docker "
-        mkdir -p $MAP_FOLDER
-        timeout 15s rosrun map_server map_saver -f $MAP_FOLDER/$MAP_NAME --occ 65 --free 25
-    " || true
+mkdir -p $MAP_FOLDER
+TARGET_BASE=$MAP_FOLDER/$MAP_NAME
+TEMP_BASE=$MAP_FOLDER/.${MAP_NAME}_nav_new_\$\$
+BACKUP_BASE=$MAP_FOLDER/.${MAP_NAME}_nav_backup_\$(date +%Y%m%d_%H%M%S)
+rm -f \${TEMP_BASE}.yaml \${TEMP_BASE}.pgm
+OLD_SUM=''
+if [ -s \${TARGET_BASE}.pgm ]; then
+    OLD_SUM=\$(md5sum \${TARGET_BASE}.pgm | awk '{print \$1}')
+fi
+for ATTEMPT in 1 2 3; do
+    echo '[MAP] map_saver attempt' \$ATTEMPT '/3'
+    timeout 35s rosrun map_server map_saver -f \$TEMP_BASE --occ 65 --free 25
+    STATUS=\$?
+    if [ \$STATUS -eq 0 ] && [ -s \${TEMP_BASE}.yaml ] && [ -s \${TEMP_BASE}.pgm ]; then
+        sed -i 's|^image:.*|image: $MAP_NAME.pgm|' \${TEMP_BASE}.yaml
+        NEW_SUM=\$(md5sum \${TEMP_BASE}.pgm | awk '{print \$1}')
+        if [ -n "\$OLD_SUM" ] && [ "\$OLD_SUM" = "\$NEW_SUM" ]; then
+            echo '[MAP WARNING] Saved map image is identical to the previous file.'
+        fi
+        if [ -s \${TARGET_BASE}.pgm ] && [ -s \${TARGET_BASE}.yaml ]; then
+            cp -f \${TARGET_BASE}.pgm \${BACKUP_BASE}.pgm
+            cp -f \${TARGET_BASE}.yaml \${BACKUP_BASE}.yaml
+            echo '[MAP] Previous map backup:' \${BACKUP_BASE}.yaml \${BACKUP_BASE}.pgm
+        fi
+        mv -f \${TEMP_BASE}.pgm \${TARGET_BASE}.pgm
+        mv -f \${TEMP_BASE}.yaml \${TARGET_BASE}.yaml
+        sync \${TARGET_BASE}.pgm \${TARGET_BASE}.yaml 2>/dev/null || sync
+        echo '[MAP] Saved files:'
+        ls -lh \${TARGET_BASE}.yaml \${TARGET_BASE}.pgm
+        echo '[MAP] Map checksum:' \$(md5sum \${TARGET_BASE}.pgm | awk '{print \$1}')
+        exit 0
+    fi
+    rm -f \${TEMP_BASE}.yaml \${TEMP_BASE}.pgm
+    sleep 2
+done
+echo '[MAP ERROR] map_saver failed after three attempts.'
+exit 1
+    " || echo "[MAP WARNING] Map save failed; previous map files were left untouched."
 }
 
 sync_device_links_inside_docker() {
@@ -888,8 +931,8 @@ cleanup() {
     stop_host_ai
     save_amcl_pose_on_exit
     stop_robot
-    stop_lidar_stack
     save_map_on_exit
+    stop_lidar_stack
 
     stop_ai_bridges
     stop_rviz

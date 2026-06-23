@@ -22,6 +22,8 @@ class MobileGateway:
         search_cancel_callback=None,
         teleop_callback=None,
         rviz_callback=None,
+        mic_control_callback=None,
+        mic_state_provider: Optional[Callable[[], bool]] = None,
         host: Optional[str] = None,
         port: Optional[int] = None,
         token: Optional[str] = None,
@@ -33,6 +35,8 @@ class MobileGateway:
         self.search_cancel_callback = search_cancel_callback
         self.teleop_callback = teleop_callback
         self.rviz_callback = rviz_callback
+        self.mic_control_callback = mic_control_callback
+        self.mic_state_provider = mic_state_provider
         self.host = host or os.environ.get("AI_MOBILE_HOST", "0.0.0.0")
         self.port = int(port or os.environ.get("AI_MOBILE_PORT", "8765"))
         self.token = token if token is not None else os.environ.get("AI_MOBILE_TOKEN", "")
@@ -131,9 +135,11 @@ class MobileGateway:
                 "capabilities": [
                     "command", "stop", "search_cancel", "teleop",
                     "map", "robot_pose", "navigation_goal", "status",
+                    "robot_mic_control",
                 ],
             })
             await self._send(websocket, self._last_status)
+            await self._send_robot_mic_state(websocket)
             await self._send_map(websocket)
 
             async for raw in websocket:
@@ -226,6 +232,15 @@ class MobileGateway:
                 await self._send_ack(websocket, request_id, "active" if active else "stopped")
             return
 
+        if message_type in {"robot_mic", "mic_control"}:
+            enabled = bool(message.get("enabled", False))
+            await self._send_ack(websocket, request_id, "executing")
+            if self.mic_control_callback:
+                self.mic_control_callback(enabled, request_id, "android")
+            else:
+                await self._send_error(websocket, "ROBOT_MIC_UNAVAILABLE", "Robot microphone control is not available.", request_id)
+            return
+
         if message_type == "ui_action" and message.get("action") == "show_rviz":
             await self._send_ack(websocket, request_id, "executing")
             if self.rviz_callback:
@@ -303,6 +318,30 @@ class MobileGateway:
         }
         payload.update(extra)
         self._schedule_broadcast(payload)
+
+    def publish_robot_mic_state(self, enabled: bool, source: str = "robot"):
+        self._schedule_broadcast({
+            "v": self.PROTOCOL_VERSION,
+            "type": "robot_mic",
+            "enabled": bool(enabled),
+            "source": source,
+            "timestamp": time.time(),
+        })
+
+    async def _send_robot_mic_state(self, websocket):
+        if self.mic_state_provider is None:
+            return
+        try:
+            enabled = bool(self.mic_state_provider())
+        except Exception:
+            return
+        await self._send(websocket, {
+            "v": self.PROTOCOL_VERSION,
+            "type": "robot_mic",
+            "enabled": enabled,
+            "source": "robot",
+            "timestamp": time.time(),
+        })
 
     def _schedule_broadcast(self, payload: Dict[str, Any]):
         if self._loop is None or not self._loop.is_running():

@@ -852,7 +852,7 @@ fi
         qz = math.sin(yaw / 2.0)
         qw = math.cos(yaw / 2.0)
 
-        print(f"[ROBOT NAV]: sending simple goal x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}", flush=True)
+        print(f"[ROBOT NAV]: sending move_base goal x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}", flush=True)
 
         # Clear only old AI helper scripts. Do not kill move_base or the UDP bridge.
         self._docker_ros("pkill -9 -f '[a]i_nav_goal.py|[a]i_persistent_move_base_goal.py' || true", timeout=4)
@@ -860,36 +860,33 @@ fi
         cmd = f"""
 python3 - << 'PY'
 import rospy
-from geometry_msgs.msg import PoseStamped
+import actionlib
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
 
-rospy.init_node('ai_send_move_base_simple_goal', anonymous=True)
-pub = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=1, latch=True)
+rospy.init_node('ai_send_move_base_action_goal', anonymous=True)
+client = actionlib.SimpleActionClient('/move_base', MoveBaseAction)
+if not client.wait_for_server(rospy.Duration(2.5)):
+    print('NO_MOVE_BASE_ACTION_SERVER')
+    raise SystemExit(2)
 
-deadline = rospy.Time.now() + rospy.Duration(0.8)
-while pub.get_num_connections() == 0 and rospy.Time.now() < deadline and not rospy.is_shutdown():
-    rospy.sleep(0.05)
+goal = MoveBaseGoal()
+goal.target_pose.header.frame_id = 'map'
+goal.target_pose.header.stamp = rospy.Time.now()
+goal.target_pose.pose.position.x = {x}
+goal.target_pose.pose.position.y = {y}
+goal.target_pose.pose.position.z = 0.0
+goal.target_pose.pose.orientation.x = 0.0
+goal.target_pose.pose.orientation.y = 0.0
+goal.target_pose.pose.orientation.z = {qz}
+goal.target_pose.pose.orientation.w = {qw}
 
-msg = PoseStamped()
-msg.header.frame_id = 'map'
-msg.header.stamp = rospy.Time.now()
-msg.pose.position.x = {x}
-msg.pose.position.y = {y}
-msg.pose.position.z = 0.0
-msg.pose.orientation.x = 0.0
-msg.pose.orientation.y = 0.0
-msg.pose.orientation.z = {qz}
-msg.pose.orientation.w = {qw}
-
-pub.publish(msg)
-rospy.sleep(0.10)
-msg.header.stamp = rospy.Time.now()
-pub.publish(msg)
-rospy.sleep(0.15)
-print('GOAL_SENT')
+client.send_goal(goal)
+rospy.sleep(0.25)
+print('ACTION_GOAL_SENT')
 PY
 """
         out = self._docker_ros(cmd, timeout=8)
-        if "GOAL_SENT" in out:
+        if "ACTION_GOAL_SENT" in out:
             with self._goal_lock:
                 invalidated = navigation_epoch != self._navigation_epoch
                 if not invalidated:
@@ -905,10 +902,10 @@ PY
                 self.cancel_navigation()
                 self.stop()
                 return False
-            print("[ROBOT NAV]: simple goal sent OK", flush=True)
+            print("[ROBOT NAV]: move_base action goal sent OK", flush=True)
             return True
 
-        print(f"[ROBOT NAV ERROR]: simple goal failed\n{out}", flush=True)
+        print(f"[ROBOT NAV ERROR]: move_base action goal failed\n{out}", flush=True)
         return False
 
     # ──────────────────────────────────────────────────────────────

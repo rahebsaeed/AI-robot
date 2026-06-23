@@ -42,8 +42,10 @@ _FAST_INTENTS = [
      "stop", 0.0, "pickup", "Attempting to pick up."),
     (r"\b(drop|release|put down)\b",
      "stop", 0.0, "drop", "Dropping the object."),
-    (r"\b(hello|hi|hey|how are you|what'?s up)\b",
+    (r"\b(hello|hi|hey)\b",
      "stop", 0.0, "home", "Hello! I am ready to help you."),
+    (r"\b(how are you|how are you doing|what'?s up)\b",
+     "stop", 0.0, "home", "I am running normally and ready to help."),
 ]
 
 
@@ -119,20 +121,26 @@ class Brain:
 
     # ── system prompt (compact) ───────────────
     @staticmethod
-    def _build_system(objects_text: str, lidar_text: str) -> str:
+    def _build_system(objects_text: str, lidar_text: str, robot_context_text: str = "") -> str:
         return (
             "You are the brain of a Rosmaster X3 PLUS robot.\n"
+            "You are connected to real robot context supplied below. Use it honestly.\n"
+            "Do not say you have no sensors when camera/lidar/map context is provided.\n"
             "Reply ONLY with this JSON (no markdown):\n"
             '{"thought":"<reason>","speech":"<spoken reply>","action":{"move":"<move>","speed":<0.0-1.0>,"arm":"<arm>"}}\n'
             "move: forward|backward|left|right|stop\n"
             "arm:  searching|pickup|drop|home\n\n"
+            f"Robot context: {robot_context_text or 'none'}\n"
             f"Camera: {objects_text}\n"
             f"Lidar:  {lidar_text}\n\n"
             "Rules (hard):\n"
             "1. move=stop, speed=0 for chat/questions.\n"
             "2. forward blocked if lidar<0.45 m.\n"
             "3. arm=home unless user explicitly asks to search/pick/drop.\n"
-            "4. Unknown command → stop.\n\n"
+            "4. For general knowledge questions, answer normally and briefly.\n"
+            "5. For robot/map/camera questions, use Robot context, Camera and Lidar only.\n"
+            "6. If a requested physical target is not visible, say so and suggest using search.\n"
+            "7. Unknown command → stop.\n\n"
             "Examples:\n"
             'User: hello → {"thought":"greeting","speech":"Hi! I am ready.","action":{"move":"stop","speed":0.0,"arm":"home"}}\n'
             'User: move forward → {"thought":"motion","speech":"Moving forward.","action":{"move":"forward","speed":0.25,"arm":"home"}}\n'
@@ -157,8 +165,30 @@ class Brain:
         return "none"
 
     # ── LLM call ─────────────────────────────
-    def _call_llm(self, user_command: str, objects_text: str, lidar_text: str) -> str:
-        system = self._build_system(objects_text, lidar_text)
+    @staticmethod
+    def _compact_context(robot_context) -> str:
+        if not robot_context:
+            return "none"
+        if isinstance(robot_context, dict):
+            parts = []
+            for key in (
+                "map",
+                "pose",
+                "navigation_goal",
+                "saved_places",
+                "vision",
+                "lidar",
+                "status",
+            ):
+                value = robot_context.get(key)
+                if value:
+                    parts.append(f"{key}={value}")
+            return "; ".join(parts)[:900] or "none"
+        return str(robot_context)[:900]
+
+    def _call_llm(self, user_command: str, objects_text: str,
+                  lidar_text: str, robot_context_text: str = "") -> str:
+        system = self._build_system(objects_text, lidar_text, robot_context_text)
 
         messages = [{"role": "system", "content": system}]
         messages.extend(self._history)
@@ -173,7 +203,7 @@ class Brain:
         with torch.no_grad():
             output_ids = self.model.generate(
                 **inputs,
-                max_new_tokens=80,
+                max_new_tokens=120,
                 do_sample=False,
                 repetition_penalty=1.12,
                 no_repeat_ngram_size=3,
@@ -202,6 +232,8 @@ class Brain:
     # ── normalise output ──────────────────────
     @staticmethod
     def _normalise(data: dict) -> dict:
+        if not isinstance(data, dict):
+            data = {}
         thought = str(data.get("thought", ""))
         speech  = str(data.get("speech", "I am ready."))
         action  = data.get("action", {}) if isinstance(data.get("action"), dict) else {}
@@ -234,8 +266,23 @@ class Brain:
             "action":  {"move": move, "speed": speed, "arm": arm}
         }
 
+    @staticmethod
+    def _plain_text_fallback(raw: str) -> dict:
+        speech = str(raw or "").strip()
+        speech = speech.replace("```json", "").replace("```", "").strip()
+        if not speech:
+            speech = "I am ready."
+        # If the model ignored the JSON format but answered the question, keep
+        # that answer instead of replacing it with the generic fallback.
+        return {
+            "thought": "plain-text model reply",
+            "speech": speech,
+            "action": {"move": "stop", "speed": 0.0, "arm": "home"},
+        }
+
     # ── public API ────────────────────────────
-    def process_command(self, user_command: str, vision_data=None, lidar_distance=None):
+    def process_command(self, user_command: str, vision_data=None,
+                        lidar_distance=None, robot_context=None):
         """
         Returns (response_dict, latency_seconds).
         response_dict always has thought / speech / action keys.
@@ -252,13 +299,17 @@ class Brain:
         objects_text = self._compact_vision(vision_data)
         lidar_text   = (f"{float(lidar_distance):.2f} m"
                         if lidar_distance is not None else "unknown")
+        robot_context_text = self._compact_context(robot_context)
 
         # 3. LLM
-        raw = self._call_llm(user_command, objects_text, lidar_text)
+        raw = self._call_llm(user_command, objects_text, lidar_text, robot_context_text)
         print(f"[BRAIN RAW]: {raw}", flush=True)
 
-        data    = self._extract_json(raw)
-        result  = self._normalise(data)
+        data = self._extract_json(raw)
+        if data:
+            result = self._normalise(data)
+        else:
+            result = self._plain_text_fallback(raw)
 
         # 4. Update rolling history (keep last 4 turns)
         self._history.append({"role": "user",      "content": user_command})

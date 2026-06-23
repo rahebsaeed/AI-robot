@@ -42,7 +42,7 @@ The server validates `AI_MOBILE_TOKEN` when it is configured and answers:
   "client_id": "android-uuid",
   "robot": "Rosmaster X3 Plus",
   "server_time": 1781787056.52,
-  "capabilities": ["command", "stop", "search_cancel", "teleop", "map", "robot_pose", "navigation_goal", "status"]
+  "capabilities": ["command", "stop", "search_cancel", "teleop", "map", "robot_pose", "navigation_goal", "status", "robot_mic_control"]
 }
 ```
 
@@ -109,7 +109,17 @@ normalized from `0.0` to `1.0` and clamped by the robot. The ROS bridge maps
 {"v":1,"type":"map_request","request_id":"uuid"}
 ```
 
-### 3.6 Application heartbeat
+### 3.6 Robot physical microphone
+
+```json
+{"v":1,"type":"robot_mic","request_id":"uuid","enabled":true}
+```
+
+The Jetson microphone starts muted by default. Enable it only when physical
+robot-side listening is needed; the Android phone microphone remains controlled
+by the app's normal conversation button.
+
+### 3.7 Application heartbeat
 
 ```json
 {"v":1,"type":"ping","request_id":"uuid","ts":1781787056.52}

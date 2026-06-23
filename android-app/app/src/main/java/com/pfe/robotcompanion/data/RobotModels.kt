@@ -75,6 +75,7 @@ data class RobotUiState(
     val transcript: String = "",
     val speechPartial: String = "",
     val isListening: Boolean = false,
+    val robotMicEnabled: Boolean = false,
     val teleopDirection: String? = null,
     val speechMode: String = "Tap the microphone to speak",
     val conversation: List<ConversationEntry> = emptyList(),
