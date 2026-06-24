@@ -819,8 +819,9 @@ class RobotFace(QMainWindow):
 
         self.stop_search_button = QPushButton("Stop", self)
         self.rviz_button = QPushButton("RViz", self)
-        self.mic_button = QPushButton("🎤 Mic ON", self)
-        self.mic_muted = False
+        default_muted = os.environ.get("AI_ROBOT_MIC_DEFAULT_MUTED", "1").strip() != "0"
+        self.mic_button = QPushButton("Mic OFF" if default_muted else "Mic ON", self)
+        self.mic_muted = default_muted
 
         for btn in (self.stop_search_button, self.rviz_button, self.mic_button):
             btn.setCursor(Qt.PointingHandCursor)
@@ -857,10 +858,10 @@ class RobotFace(QMainWindow):
     def _toggle_mic(self):
         self.mic_muted = not self.mic_muted
         if self.mic_muted:
-            self.mic_button.setText("🔇 Mic OFF")
+            self.mic_button.setText("Mic OFF")
             self._send_ui_command("mic_off")
         else:
-            self.mic_button.setText("🎤 Mic ON")
+            self.mic_button.setText("Mic ON")
             self._send_ui_command("mic_on")
 
     def _open_rviz_from_button(self):

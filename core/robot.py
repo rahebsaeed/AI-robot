@@ -1015,23 +1015,25 @@ PY
                               spacing_m=1.00, max_points=90,
                               clearance_m=0.50) -> List[Dict]:
         docker_py = r'''
-import os, re, json, cv2, numpy as np
+import os, re, json, math
+import cv2
+import numpy as np
 
-map_name    = "__MAP_NAME__"
-map_folder  = "/root/yahboomcar_ws/src/yahboomcar_nav/maps"
-yaml_path   = os.path.join(map_folder, map_name + ".yaml")
+map_name = __MAP_NAME__
+map_folder = "/root/yahboomcar_ws/src/yahboomcar_nav/maps"
+yaml_path = os.path.join(map_folder, map_name + ".yaml")
 
 if not os.path.exists(yaml_path):
     print("[]"); raise SystemExit(0)
 
-txt = open(yaml_path).read()
+txt = open(yaml_path, "r").read()
 
 def get_value(key, default=None):
     m = re.search(r"^" + re.escape(key) + r"\s*:\s*(.+)$", txt, re.M)
     return m.group(1).strip() if m else default
 
-resolution  = float(get_value("resolution", "0.05"))
-origin_txt  = get_value("origin", "[0.0, 0.0, 0.0]")
+resolution = float(get_value("resolution", "0.05"))
+origin_txt = get_value("origin", "[0.0, 0.0, 0.0]")
 origin_vals = [float(v) for v in re.findall(r"[-+]?\d*\.?\d+", origin_txt)]
 origin_x, origin_y = (origin_vals[0], origin_vals[1]) if len(origin_vals) >= 2 else (0.0, 0.0)
 
@@ -1042,37 +1044,102 @@ if img is None:
     print("[]"); raise SystemExit(0)
 
 h, w = img.shape[:2]
-spacing_m  = float("__SPACING_M__")
-max_points = int("__MAX_POINTS__")
-clearance_m = float("__CLEARANCE_M__")
-step       = max(1, int(spacing_m / resolution))
+spacing_m = max(resolution * 2.0, float(__SPACING_M__))
+max_points = max(1, int(__MAX_POINTS__))
+clearance_m = max(0.0, float(__CLEARANCE_M__))
+step = max(4, int(round(spacing_m / resolution)))
+clearance_px = max(6, int(round(clearance_m / resolution)))
 
-# Conservative wall clearance keeps search goals out of inflated obstacles.
-clearance_px = max(8, int(clearance_m / resolution))
+free = img >= 245
+unknown = (img >= 200) & (img < 245)
+occupied = img < 200
 
-# Dilate occupied pixels so waypoints stay away from walls
-kernel   = np.ones((clearance_px*2+1, clearance_px*2+1), np.uint8)
-occupied = cv2.dilate((img < 200).astype(np.uint8) * 255, kernel)
+obstacle_kernel = np.ones((clearance_px * 2 + 1, clearance_px * 2 + 1), np.uint8)
+occupied_inflated = cv2.dilate(occupied.astype(np.uint8), obstacle_kernel) > 0
+safe_free = free & (~occupied_inflated)
 
-points = []
+frontier_kernel = np.ones((5, 5), np.uint8)
+unknown_near = cv2.dilate(unknown.astype(np.uint8), frontier_kernel) > 0
+frontier = safe_free & unknown_near
+
+unknown_u8 = unknown.astype(np.uint8)
+frontier_u8 = frontier.astype(np.uint8)
+free_u8 = safe_free.astype(np.uint8)
+
+def box_sum(mask, px, py, radius):
+    x0 = max(0, px - radius)
+    x1 = min(w, px + radius + 1)
+    y0 = max(0, py - radius)
+    y1 = min(h, py + radius + 1)
+    return int(mask[y0:y1, x0:x1].sum())
+
+def world_x(px):
+    return origin_x + px * resolution
+
+def world_y(py):
+    return origin_y + (h - py) * resolution
+
+def yaw_toward_information(px, py, radius):
+    x0 = max(0, px - radius)
+    x1 = min(w, px + radius + 1)
+    y0 = max(0, py - radius)
+    y1 = min(h, py + radius + 1)
+    ys, xs = np.nonzero(unknown[y0:y1, x0:x1])
+    if len(xs) > 0:
+        dx = float(xs.mean() + x0 - px)
+        dy = float(ys.mean() + y0 - py)
+        return math.atan2(-dy, dx)
+    return math.atan2(world_y(h // 2) - world_y(py), world_x(w // 2) - world_x(px))
+
+info_radius = max(step, int(round(1.40 / resolution)))
+candidates = []
 for py in range(clearance_px, h - clearance_px, step):
     for px in range(clearance_px, w - clearance_px, step):
-        if occupied[py, px] > 0:
-            continue        # too close to wall / obstacle
-        if img[py, px] < 245:
-            continue        # not clearly free
-        x = origin_x + px * resolution
-        y = origin_y + (h - py) * resolution
-        points.append({"x": round(float(x),3), "y": round(float(y),3), "yaw": 0.0})
+        if not safe_free[py, px]:
+            continue
+        frontier_score = box_sum(frontier_u8, px, py, info_radius)
+        unknown_score = box_sum(unknown_u8, px, py, info_radius)
+        free_score = box_sum(free_u8, px, py, max(2, step // 2))
+        score = frontier_score * 5.0 + unknown_score * 1.5 + free_score * 0.03
+        if score <= 0.0:
+            score = 0.01
+        candidates.append((score, px, py))
 
-if len(points) > max_points:
-    stride = max(1, len(points) // max_points)
-    points = points[::stride][:max_points]
+if not candidates:
+    print("[]"); raise SystemExit(0)
+
+candidates.sort(reverse=True)
+selected = []
+min_sep_px = max(4, int(round((spacing_m * 0.75) / resolution)))
+for score, px, py in candidates:
+    if any((px - sx) ** 2 + (py - sy) ** 2 < min_sep_px ** 2 for _s, sx, sy in selected):
+        continue
+    selected.append((score, px, py))
+    if len(selected) >= max_points:
+        break
+
+if len(selected) < min(max_points, 12):
+    for score, px, py in candidates:
+        if any(px == sx and py == sy for _s, sx, sy in selected):
+            continue
+        selected.append((score, px, py))
+        if len(selected) >= max_points:
+            break
+
+points = []
+for score, px, py in selected:
+    yaw = yaw_toward_information(px, py, info_radius)
+    points.append({
+        "x": round(float(world_x(px)), 3),
+        "y": round(float(world_y(py)), 3),
+        "yaw": round(float(yaw), 3),
+        "score": round(float(score), 3),
+    })
 
 print(json.dumps(points))
 '''
         docker_py = (docker_py
-                     .replace("__MAP_NAME__",  str(map_name))
+                     .replace("__MAP_NAME__", json.dumps(str(map_name)))
                      .replace("__SPACING_M__", str(float(spacing_m)))
                      .replace("__MAX_POINTS__", str(int(max_points)))
                      .replace("__CLEARANCE_M__", str(float(clearance_m))))
@@ -1080,10 +1147,154 @@ print(json.dumps(points))
         out = self._docker_ros("python3 - << 'PY'\n" + docker_py + "\nPY\n", timeout=12)
         try:
             pts = json.loads(out.splitlines()[-1])
-            print(f"[ROBOT MAP]: generated {len(pts)} search waypoints", flush=True)
+            print(f"[ROBOT MAP]: generated {len(pts)} camera-aware search waypoints", flush=True)
             return pts
         except Exception as e:
             print(f"[ROBOT MAP ERROR]: {e}", flush=True)
+            return []
+
+    def get_waypoints_near(self, map_name: str, x: float, y: float, yaw: float = 0.0,
+                           clearance_m: float = 0.45, max_points: int = 12) -> List[Dict]:
+        docker_py = r'''
+import os, re, json, math
+import cv2
+import numpy as np
+
+map_name = __MAP_NAME__
+target_x = float(__TARGET_X__)
+target_y = float(__TARGET_Y__)
+target_yaw = float(__TARGET_YAW__)
+clearance_m = max(0.0, float(__CLEARANCE_M__))
+max_points = max(1, int(__MAX_POINTS__))
+
+map_folder = "/root/yahboomcar_ws/src/yahboomcar_nav/maps"
+yaml_path = os.path.join(map_folder, map_name + ".yaml")
+if not os.path.exists(yaml_path):
+    print("[]"); raise SystemExit(0)
+
+txt = open(yaml_path, "r").read()
+
+def get_value(key, default=None):
+    m = re.search(r"^" + re.escape(key) + r"\s*:\s*(.+)$", txt, re.M)
+    return m.group(1).strip() if m else default
+
+resolution = float(get_value("resolution", "0.05"))
+origin_txt = get_value("origin", "[0.0, 0.0, 0.0]")
+origin_vals = [float(v) for v in re.findall(r"[-+]?\d*\.?\d+", origin_txt)]
+origin_x, origin_y = (origin_vals[0], origin_vals[1]) if len(origin_vals) >= 2 else (0.0, 0.0)
+image_file = get_value("image", map_name + ".pgm").strip().strip('"').strip("'")
+image_path = image_file if image_file.startswith("/") else os.path.join(map_folder, image_file)
+img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+if img is None:
+    print("[]"); raise SystemExit(0)
+
+h, w = img.shape[:2]
+free = img >= 245
+occupied = img < 200
+clearance_px = max(6, int(round(clearance_m / resolution)))
+kernel = np.ones((clearance_px * 2 + 1, clearance_px * 2 + 1), np.uint8)
+occupied_inflated = cv2.dilate(occupied.astype(np.uint8), kernel) > 0
+safe_free = free & (~occupied_inflated)
+
+def world_to_px(wx, wy):
+    px = int(round((wx - origin_x) / resolution))
+    py = int(round(h - ((wy - origin_y) / resolution)))
+    return px, py
+
+def in_bounds(px, py):
+    return 0 <= px < w and 0 <= py < h
+
+def is_safe(wx, wy):
+    px, py = world_to_px(wx, wy)
+    return in_bounds(px, py) and bool(safe_free[py, px])
+
+def line_clear(wx0, wy0, wx1, wy1):
+    px0, py0 = world_to_px(wx0, wy0)
+    px1, py1 = world_to_px(wx1, wy1)
+    steps = max(abs(px1 - px0), abs(py1 - py0), 1)
+    blocked = 0
+    for i in range(steps + 1):
+        t = i / float(steps)
+        px = int(round(px0 + (px1 - px0) * t))
+        py = int(round(py0 + (py1 - py0) * t))
+        if not in_bounds(px, py):
+            blocked += 2
+            continue
+        if occupied[py, px]:
+            blocked += 1
+    return blocked == 0
+
+def local_clearance_score(wx, wy):
+    px, py = world_to_px(wx, wy)
+    if not in_bounds(px, py):
+        return 0
+    radius = max(2, int(round(0.45 / resolution)))
+    x0 = max(0, px - radius)
+    x1 = min(w, px + radius + 1)
+    y0 = max(0, py - radius)
+    y1 = min(h, py + radius + 1)
+    return int(safe_free[y0:y1, x0:x1].sum())
+
+candidates = []
+if is_safe(target_x, target_y):
+    candidates.append({
+        "x": target_x, "y": target_y, "yaw": target_yaw,
+        "kind": "saved", "score": 10000.0,
+    })
+
+radii = [0.45, 0.65, 0.85, 1.10, 1.35, 1.65]
+angles = [0.0, math.pi, math.pi / 2.0, -math.pi / 2.0,
+          math.pi / 4.0, -math.pi / 4.0, 3.0 * math.pi / 4.0, -3.0 * math.pi / 4.0,
+          math.pi / 8.0, -math.pi / 8.0, 7.0 * math.pi / 8.0, -7.0 * math.pi / 8.0]
+
+for radius in radii:
+    for angle in angles:
+        wx = target_x + math.cos(angle) * radius
+        wy = target_y + math.sin(angle) * radius
+        if not is_safe(wx, wy):
+            continue
+        face_yaw = math.atan2(target_y - wy, target_x - wx)
+        clear_line = line_clear(wx, wy, target_x, target_y)
+        score = local_clearance_score(wx, wy) - radius * 20.0
+        if clear_line:
+            score += 250.0
+        candidates.append({
+            "x": wx, "y": wy, "yaw": face_yaw,
+            "kind": "approach", "radius": radius, "line_clear": clear_line,
+            "score": score,
+        })
+
+candidates.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+selected = []
+for item in candidates:
+    if any(math.hypot(item["x"] - old["x"], item["y"] - old["y"]) < 0.18 for old in selected):
+        continue
+    selected.append(item)
+    if len(selected) >= max_points:
+        break
+
+for item in selected:
+    item["x"] = round(float(item["x"]), 3)
+    item["y"] = round(float(item["y"]), 3)
+    item["yaw"] = round(float(item.get("yaw", 0.0)), 3)
+    item["score"] = round(float(item.get("score", 0.0)), 3)
+
+print(json.dumps(selected))
+'''
+        docker_py = (docker_py
+                     .replace("__MAP_NAME__", json.dumps(str(map_name)))
+                     .replace("__TARGET_X__", str(float(x)))
+                     .replace("__TARGET_Y__", str(float(y)))
+                     .replace("__TARGET_YAW__", str(float(yaw)))
+                     .replace("__CLEARANCE_M__", str(float(clearance_m)))
+                     .replace("__MAX_POINTS__", str(int(max_points))))
+        out = self._docker_ros("python3 - << 'PY'\n" + docker_py + "\nPY\n", timeout=12)
+        try:
+            pts = json.loads(out.splitlines()[-1])
+            print(f"[ROBOT MAP]: generated {len(pts)} approach goals near x={float(x):.2f}, y={float(y):.2f}", flush=True)
+            return pts
+        except Exception as e:
+            print(f"[ROBOT MAP ERROR]: approach goals failed: {e}", flush=True)
             return []
 
     def get_map_snapshot(self, map_name="salle_robotique", force=False) -> Optional[Dict]:

@@ -31,7 +31,7 @@ The core user workflow is:
 3. The user gives voice commands.
 4. The AI either answers conversationally, moves the robot, navigates to saved places, or searches the map for objects.
 5. Search uses map waypoints and live camera detection.
-6. CTRL+C stops AI, robot motion, lidar drivers, ROS nodes, and saves the map.
+6. CTRL+C stops AI, robot motion, clears costmaps, stops lidar drivers, and stops ROS nodes.
 
 ## 2. Main Files
 
@@ -115,8 +115,8 @@ The two zones communicate through UDP and ROS topics.
 11. Starts navigation with the selected map.
 12. Verifies `/scan`, `/map`, `/tf`, AMCL, and move_base services.
 13. Validates usable laser ranges and the `odom -> base -> laser` TF chain.
-14. Seeds AMCL from a configured or saved pose when available; otherwise starts
-    global localization.
+14. Seeds AMCL only from an explicitly configured pose; otherwise starts fresh
+    global localization across the full map.
 15. Runs up to three alternating full rotations and requests AMCL no-motion
     updates between attempts.
 16. Requires covariance convergence and a valid `map -> base` transform.
@@ -142,9 +142,10 @@ export AI_AMCL_INITIAL_YAW=1.57
 ./start_navigation.sh salle_robotique
 ```
 
-As soon as AMCL converges, and again on a clean CTRL+C shutdown, the launcher
-saves the pose in `config/last_amcl_pose.json` and uses it on the next startup. Set
-`AI_AMCL_USE_SAVED_POSE=0` if the robot was physically moved while powered off.
+By default the launcher does not reuse `config/last_amcl_pose.json`, because the
+robot may have been physically moved while powered off. It starts fresh AMCL
+global localization and rotates the robot to let AMCL find the current position.
+Saved-pose reuse is available only as an explicit opt-in for controlled tests.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -159,7 +160,8 @@ saves the pose in `config/last_amcl_pose.json` and uses it on the next startup. 
 | `AI_AMCL_UPDATE_MIN_A` | `0.20` | Minimum angular change between AMCL updates in radians. |
 | `AI_AMCL_MAX_POSITION_STD` | `0.70` | Maximum accepted position standard deviation in metres. |
 | `AI_AMCL_MAX_YAW_STD` | `0.55` | Maximum accepted yaw standard deviation in radians. |
-| `AI_AMCL_USE_SAVED_POSE` | `1` | Reuse the last converged pose for the same map. |
+| `AI_AMCL_USE_SAVED_POSE` | `0` | Reuse the last converged pose for the same map. Keep disabled if the robot may be moved manually. |
+| `AI_AMCL_SAVE_POSE` | `0` | Save a converged pose to `config/last_amcl_pose.json` for optional future reuse. |
 | `AI_AMCL_SAVED_POSE_MAX_AGE` | `604800` | Maximum saved-pose age in seconds. |
 
 ## 6. ROS Bridge Details
@@ -491,25 +493,27 @@ RViz displays:
 CTRL+C in `start_navigation.sh` runs `cleanup()`:
 
 1. Stop host AI and face interface.
-2. Save a converged AMCL pose for the next startup.
+2. Optionally save a converged AMCL pose only when `AI_AMCL_SAVE_POSE=1`.
 3. Stop robot motion and stale `/cmd_vel` publishers.
-4. Save a live SLAM map if `/map` is being published by a mapper.
-5. Stop lidar motor and lidar ROS drivers.
-6. Stop AI bridges and RViz.
-7. Stop ROS nodes and roscore.
-8. Restore terminal state.
+4. Clear move_base costmaps by default.
+5. Optionally save a live SLAM map only when `AI_SAVE_MAP_ON_EXIT=1`.
+6. Stop lidar motor and lidar ROS drivers.
+7. Stop AI bridges and RViz.
+8. Stop ROS nodes and roscore.
+9. Restore terminal state.
 
-Map saving can be disabled:
+Costmap clearing can be disabled:
 
 ```bash
-export AI_SAVE_MAP_ON_EXIT=0
+export AI_CLEAR_COSTMAPS_ON_EXIT=0
 ```
 
 Normal AMCL navigation reads a static map from `map_server`; it does not update
-the occupancy grid. On shutdown, `start_navigation.sh` now skips map saving when
-`/map` is static and prints the reason. Use `auto_scan.sh MAP_NAME` to update a
-saved occupancy map. Set `AI_SAVE_STATIC_MAP_ON_EXIT=1` only when you explicitly
-want to re-save the unchanged static map.
+the occupancy grid. On shutdown, `start_navigation.sh` does not save map files
+by default. Use `auto_scan.sh MAP_NAME` to update a saved occupancy map. Set
+`AI_SAVE_MAP_ON_EXIT=1` only when running a live SLAM mapper, and set
+`AI_SAVE_STATIC_MAP_ON_EXIT=1` only when you explicitly want to re-save the
+unchanged static map.
 
 ## 16. Safety Rules
 
@@ -613,8 +617,8 @@ docker exec -it yahboom_container /bin/bash -lc "rosrun tf tf_echo odom base_foo
 ```
 
 If the robot starts at a fixed location, set `AI_AMCL_INITIAL_X`,
-`AI_AMCL_INITIAL_Y`, and `AI_AMCL_INITIAL_YAW` once. A clean shutdown then
-persists the converged pose for later starts.
+`AI_AMCL_INITIAL_Y`, and `AI_AMCL_INITIAL_YAW`. Otherwise leave those unset and
+the launcher will use fresh global localization with a rotation scan.
 
 ## 19. Professional Automatic Mapping
 

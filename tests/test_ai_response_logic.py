@@ -37,6 +37,7 @@ sys.modules.setdefault("ultralytics", ultralytics_stub)
 from core.brain import Brain
 from core.places_memory import PlacesMemory
 from main import (
+    build_place_navigation_goals,
     build_safe_action,
     describe_current_place,
     describe_map_identity,
@@ -59,6 +60,15 @@ class FakeRobot:
 
     def get_amcl_pose(self):
         return self.pose
+
+
+class FakeApproachRobot(FakeRobot):
+    def get_waypoints_near(self, map_name, x, y, yaw=0.0, clearance_m=0.45, max_points=12):
+        return [
+            {"x": x, "y": y, "yaw": yaw, "kind": "saved"},
+            {"x": x + 0.7, "y": y, "yaw": 3.14, "kind": "approach", "radius": 0.7},
+            {"x": x, "y": y + 0.7, "yaw": -1.57, "kind": "approach", "radius": 0.7},
+        ]
 
 
 class AiResponseLogicTest(unittest.TestCase):
@@ -108,6 +118,19 @@ class AiResponseLogicTest(unittest.TestCase):
 
         self.assertEqual("My current location is at the initial position.", result["speech"])
         self.assertEqual("home", result["action"]["arm"])
+
+    def test_saved_place_navigation_builds_alternate_approach_goals(self):
+        goals = build_place_navigation_goals(
+            FakeApproachRobot(),
+            "salle_robotique",
+            {"x": -4.0, "y": 2.0, "yaw": 0.0},
+            max_goals=4,
+        )
+
+        self.assertEqual("saved", goals[0]["kind"])
+        self.assertGreaterEqual(len(goals), 3)
+        self.assertEqual(1, sum(1 for goal in goals if goal["kind"] == "saved"))
+        self.assertTrue(any(goal["kind"] == "approach" for goal in goals))
 
 
 if __name__ == "__main__":

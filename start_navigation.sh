@@ -123,7 +123,7 @@ pkill -9 -f 'ydlidar_node|rplidarNode|sllidar_node|laser_astrapro_bringup.launch
 }
 
 save_map_on_exit() {
-    if [ "${AI_SAVE_MAP_ON_EXIT:-1}" = "0" ]; then
+    if [ "${AI_SAVE_MAP_ON_EXIT:-0}" = "0" ]; then
         echo "[MAP] Save skipped because AI_SAVE_MAP_ON_EXIT=0"
         return
     fi
@@ -151,7 +151,7 @@ for ATTEMPT in 1 2 3; do
     echo '[MAP] map_saver attempt' \$ATTEMPT '/3'
     timeout 35s rosrun map_server map_saver -f \$TEMP_BASE --occ 65 --free 25
     STATUS=\$?
-    if [ \$STATUS -eq 0 ] && [ -s \${TEMP_BASE}.yaml ] && [ -s \${TEMP_BASE}.pgm ]; then
+    if [ "\${STATUS:-1}" -eq 0 ] && [ -s \${TEMP_BASE}.yaml ] && [ -s \${TEMP_BASE}.pgm ]; then
         sed -i 's|^image:.*|image: $MAP_NAME.pgm|' \${TEMP_BASE}.yaml
         NEW_SUM=\$(md5sum \${TEMP_BASE}.pgm | awk '{print \$1}')
         if [ -n "\$OLD_SUM" ] && [ "\$OLD_SUM" = "\$NEW_SUM" ]; then
@@ -176,6 +176,21 @@ done
 echo '[MAP ERROR] map_saver failed after three attempts.'
 exit 1
     " || echo "[MAP WARNING] Map save failed; previous map files were left untouched."
+}
+
+clear_costmaps_on_exit() {
+    if [ "${AI_CLEAR_COSTMAPS_ON_EXIT:-1}" = "0" ]; then
+        echo "[COSTMAP] Clear skipped because AI_CLEAR_COSTMAPS_ON_EXIT=0"
+        return
+    fi
+    echo "[COSTMAP] Clearing move_base costmaps before shutdown..."
+    run_in_docker "
+if rosservice list 2>/dev/null | grep -q '^/move_base/clear_costmaps$'; then
+    rosservice call /move_base/clear_costmaps '{}' >/dev/null 2>&1 || true
+else
+    echo '[COSTMAP] /move_base/clear_costmaps is not available.'
+fi
+    " || true
 }
 
 sync_device_links_inside_docker() {
@@ -295,7 +310,14 @@ select_amcl_initial_pose() {
         return 0
     fi
 
-    if [ "${AI_AMCL_USE_SAVED_POSE:-1}" = "0" ] || [ ! -f "$LAST_AMCL_POSE_FILE" ]; then
+    if [ "${AI_AMCL_USE_SAVED_POSE:-0}" = "0" ]; then
+        if [ -f "$LAST_AMCL_POSE_FILE" ]; then
+            echo "[AMCL] Ignoring saved pose by default: $LAST_AMCL_POSE_FILE"
+        fi
+        return 1
+    fi
+
+    if [ ! -f "$LAST_AMCL_POSE_FILE" ]; then
         return 1
     fi
 
@@ -367,6 +389,7 @@ initialize_amcl() {
         fi
         echo "[AMCL WARNING] Seeded pose needs scan refinement."
     else
+        echo "[AMCL] No trusted initial pose selected; using fresh global localization."
         trigger_global_localization || return 1
     fi
 
@@ -421,7 +444,7 @@ initialize_amcl() {
 }
 
 save_amcl_pose_on_exit() {
-    if [ "${AI_AMCL_SAVE_POSE:-1}" = "0" ] || [ ! -f "$AMCL_TOOL" ]; then
+    if [ "${AI_AMCL_SAVE_POSE:-0}" = "0" ] || [ ! -f "$AMCL_TOOL" ]; then
         return
     fi
 
@@ -931,7 +954,10 @@ cleanup() {
     stop_host_ai
     save_amcl_pose_on_exit
     stop_robot
-    save_map_on_exit
+    clear_costmaps_on_exit
+    if [ "${AI_SAVE_MAP_ON_EXIT:-0}" != "0" ]; then
+        save_map_on_exit
+    fi
     stop_lidar_stack
 
     stop_ai_bridges
@@ -1031,7 +1057,7 @@ echo ""
 echo "Single launcher:"
 echo "  ~/start_navigation.sh $MAP_NAME"
 echo ""
-echo "Press CTRL+C here to stop AI, save map, and stop ROS."
+echo "Press CTRL+C here to stop AI, clear costmaps, and stop ROS."
 echo ""
 echo "Useful logs:"
 echo "  tail -f /tmp/ai_companion.log"

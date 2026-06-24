@@ -1,0 +1,25 @@
+ssh jetson@192.168.50.196
+
+  Then run:
+
+  echo "=== startup services ==="
+  systemctl list-unit-files | grep -Ei "yahboom|robot|camera|app|ros|web|mjpg|video" || true
+
+  echo "=== robot-init service ==="
+  systemctl status robot-init.service --no-pager
+  systemctl cat robot-init.service
+
+  echo "=== running camera/app processes ==="
+  ps -ef | grep -Ei "yahboom|robot|camera|video|mjpg|web|app|roslaunch|python" | grep -v grep
+
+  echo "=== autostart files ==="
+  find /home/jetson /root /etc/systemd/system /lib/systemd/system \
+    -maxdepth 4 \( -name "*.service" -o -name "*.desktop" -o -name "*.sh" -o -name "*.py" \) \
+    2>/dev/null | grep -Ei "yahboom|robot|camera|app|start|boot|auto"
+
+  echo "=== camera devices ==="
+  ls -l /dev/video* /dev/v4l/by-id/* /dev/v4l/by-path/* 2>/dev/null
+  v4l2-ctl --list-devices 2>/dev/null || true
+
+  Paste me the output. The file we need is most likely started by robot-init.service or a desktop autostart entry, and the head
+  camera issue is probably /dev/video0 / /dev/video1 changing after reboot.

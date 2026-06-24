@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from core.search_tasks import is_search_request, is_searchable_target, parse_search_target
+from core.search_tasks import MapSearchTask, is_search_request, is_searchable_target, parse_search_target
 import tools.professional_explorer as explorer_module
 from tools.professional_explorer import ExplorationMemory, FrontierExplorer
 
@@ -22,6 +22,38 @@ class MemoryStub:
 
     def failure_penalty(self, goal):
         return 0
+
+
+class SearchRobotStub:
+    def __init__(self):
+        self.goals = []
+
+    def cancel_navigation(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def clear_costmaps(self):
+        pass
+
+    def get_search_waypoints(self, *_args, **_kwargs):
+        return [{"x": 1.0, "y": 2.0, "yaw": 1.25}]
+
+    def get_amcl_pose(self):
+        return {"x": 0.0, "y": 0.0, "yaw": 0.0}
+
+    def goto_map(self, x, y, yaw=0.0):
+        self.goals.append((x, y, yaw))
+        return True
+
+    def distance_to(self, x, y):
+        return 0.30
+
+
+class SearchPerceptionsStub:
+    def set_moving(self, _moving):
+        pass
 
 
 class ProfessionalExplorerTest(unittest.TestCase):
@@ -158,6 +190,16 @@ class ProfessionalExplorerTest(unittest.TestCase):
         self.assertFalse(is_search_request("where are you"))
         self.assertFalse(is_searchable_target("you"))
         self.assertTrue(is_search_request("where is the door"))
+
+    def test_map_search_uses_waypoint_yaw_for_camera_orientation(self):
+        robot = SearchRobotStub()
+        task = MapSearchTask(robot, SearchPerceptionsStub())
+        task._read_vision = lambda force=False: {"objects": [], "description": ""}
+
+        result = task.search("bottle")
+
+        self.assertFalse(result["found"])
+        self.assertEqual([(1.0, 2.0, 1.25)], robot.goals)
 
     def test_close_startup_frontier_can_be_selected(self):
         explorer_module.rospy = SimpleNamespace(logwarn=lambda *args, **kwargs: None)

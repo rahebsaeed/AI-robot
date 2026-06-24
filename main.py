@@ -191,12 +191,14 @@ def deliver_response(perceptions, face, mobile_gateway, envelope,
 class UiCommandListener:
     def __init__(self, robot: Robot, search_task: MapSearchTask,
                  face: FaceBridge, perceptions: Perceptions,
-                 stop_search_callback=None, host="127.0.0.1", port=5006):
+                 stop_search_callback=None, mic_control_callback=None,
+                 host="127.0.0.1", port=5006):
         self.robot = robot
         self.search_task = search_task
         self.face = face
         self.perceptions = perceptions
         self.stop_search_callback = stop_search_callback
+        self.mic_control_callback = mic_control_callback
         self.host = host
         self.port = port
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -224,11 +226,17 @@ class UiCommandListener:
                 elif command == "show_rviz":
                     self._handle_show_rviz()
                 elif command == "mic_off":
-                    self.perceptions.set_mute(True)
+                    self._set_microphone(False)
                 elif command == "mic_on":
-                    self.perceptions.set_mute(False)
+                    self._set_microphone(True)
             except Exception as e:
                 print(f"[UI COMMAND ERROR] {e}", flush=True)
+
+    def _set_microphone(self, enabled: bool):
+        if self.mic_control_callback is not None:
+            self.mic_control_callback(bool(enabled), "", "face_ui")
+            return
+        self.perceptions.set_mute(not bool(enabled))
 
     def _handle_stop_search(self):
         print("[UI COMMAND] stop_search", flush=True)
@@ -398,6 +406,56 @@ def nearest_saved_place(map_name: str, places_memory: PlacesMemory, pose: dict):
         if best is None or dist < best[2]:
             best = (name, place, dist)
     return best
+
+def build_place_navigation_goals(robot: Robot, map_name: str, place: dict,
+                                 max_goals: int | None = None) -> list:
+    target_x = float(place["x"])
+    target_y = float(place["y"])
+    target_yaw = float(place.get("yaw", 0.0))
+    if max_goals is None:
+        max_goals = int(os.environ.get("AI_PLACE_APPROACH_GOALS", "8"))
+    max_goals = max(1, int(max_goals))
+
+    goals = []
+
+    def add_goal(goal: dict, default_kind: str = "approach"):
+        try:
+            x = float(goal["x"])
+            y = float(goal["y"])
+        except Exception:
+            return
+        yaw = float(goal.get("yaw", math.atan2(target_y - y, target_x - x)))
+        kind = str(goal.get("kind", default_kind))
+        for existing in goals:
+            if math.hypot(existing["x"] - x, existing["y"] - y) < 0.18:
+                return
+        goals.append({
+            "x": x,
+            "y": y,
+            "yaw": yaw,
+            "kind": kind,
+            "radius": float(goal.get("radius", 0.0) or 0.0),
+            "line_clear": bool(goal.get("line_clear", False)),
+        })
+
+    add_goal({"x": target_x, "y": target_y, "yaw": target_yaw, "kind": "saved"}, "saved")
+
+    if hasattr(robot, "get_waypoints_near") and len(goals) < max_goals:
+        try:
+            clearance = float(os.environ.get("AI_PLACE_APPROACH_CLEARANCE_M", "0.45"))
+            candidates = robot.get_waypoints_near(
+                map_name, target_x, target_y, target_yaw,
+                clearance_m=clearance,
+                max_points=max_goals * 2,
+            )
+            for candidate in candidates:
+                add_goal(candidate, "approach")
+                if len(goals) >= max_goals:
+                    break
+        except Exception as e:
+            print(f"[PLACES NAV] Could not generate map approach goals: {e}", flush=True)
+
+    return goals[:max_goals]
 
 def describe_current_place(robot: Robot, map_name: str, places_memory: PlacesMemory) -> str:
     pose = current_pose_for_facts(robot)
@@ -860,6 +918,7 @@ def main():
     ui_commands = UiCommandListener(
         robot, search_task, face, perceptions,
         stop_search_callback=cancel_search,
+        mic_control_callback=set_robot_microphone,
     )
     ui_commands.start()
 
@@ -1011,72 +1070,140 @@ def main():
                     if hasattr(robot, "clear_costmaps"):
                         robot.clear_costmaps()
 
-                    goal_started = robot.goto_map(saved_place["x"], saved_place["y"], saved_place["yaw"])
-                    if not goal_started:
-                        if command_generation != current_operation_generation():
-                            mobile_gateway.publish_response(
-                                envelope.request_id,
-                                "Navigation command cancelled.",
-                                envelope.source,
-                                status="cancelled",
-                            )
-                            continue
-                        speech = f"I could not start navigation to {target}."
-                        deliver_response(
-                            perceptions, face, mobile_gateway, envelope, command, speech,
-                            status="failed",
-                        )
-                        face_show_search(
-                            face, target, "navigation_failed", 0, 0, objects,
-                            message=speech, can_talk=True
-                        )
-                        continue
-
-                    t_start = time.time()
-                    nav_timeout = 35.0
+                    nav_goals = build_place_navigation_goals(robot, map_name, saved_place)
+                    route_total = len(nav_goals)
+                    nav_timeout = float(os.environ.get("AI_PLACE_NAV_TIMEOUT", "35.0"))
+                    arrival_radius = float(os.environ.get("AI_PLACE_ARRIVAL_RADIUS", "0.55"))
+                    approach_radius = float(os.environ.get("AI_PLACE_APPROACH_RADIUS", "1.10"))
+                    goal_radius = float(os.environ.get("AI_PLACE_GOAL_RADIUS", "0.55"))
+                    start_grace = float(os.environ.get("AI_PLACE_START_GRACE_SECONDS", "5.0"))
                     arrived = False
                     interrupted = False
-                    stuck_timeout = 8.0
-                    last_progress = time.time()
-                    best_d = None
+                    reached_approach = False
+                    stuck_timeout = float(os.environ.get("AI_PLACE_STUCK_TIMEOUT", "8.0"))
+                    attempted_routes = 0
+                    started_routes = 0
+                    last_route_error = "no route was tried"
                     progress_thresh = 0.10
 
                     try:
                         if hasattr(perceptions, "set_moving"):
                             perceptions.set_moving(True)
 
-                        while time.time() - t_start < nav_timeout:
+                        for route_idx, goal in enumerate(nav_goals, start=1):
+                            attempted_routes = route_idx
                             if command_generation != current_operation_generation():
                                 interrupted = True
                                 break
-                            d = robot.distance_to(saved_place["x"], saved_place["y"])
-                            distance_msg = "Navigating to place..."
-                            if d is not None:
-                                distance_msg = f"Navigating. Distance to {target}: {d:.2f} m"
-                                if d <= 0.45:
-                                    arrived = True
-                                    break
 
-                                if best_d is None or d < best_d - progress_thresh:
-                                    best_d = d
-                                    last_progress = time.time()
-                                elif time.time() - last_progress > stuck_timeout:
-                                    print("[NAV STUCK] Stuck navigating to place", flush=True)
-                                    break
+                            if route_idx > 1:
+                                robot.cancel_navigation()
+                                robot.stop()
+                                if hasattr(robot, "clear_costmaps"):
+                                    robot.clear_costmaps()
 
+                            route_kind = "saved point" if goal.get("kind") == "saved" else "safe approach"
+                            print(
+                                f"[TASK] PLACE ROUTE {route_idx}/{route_total}: "
+                                f"{route_kind} x={goal['x']:.2f}, y={goal['y']:.2f}, yaw={goal.get('yaw', 0.0):.2f}",
+                                flush=True,
+                            )
                             face.send_status({
                                 "mode": "searching",
                                 "target": target,
                                 "phase": "navigating",
-                                "waypoint_index": 1,
-                                "waypoint_total": 1,
-                                "searched_count": 0,
+                                "waypoint_index": route_idx,
+                                "waypoint_total": route_total,
+                                "searched_count": max(0, route_idx - 1),
                                 "found": False,
-                                "message": distance_msg,
+                                "message": f"Trying route {route_idx}/{route_total} to {target}",
                                 "objects": objects[:4],
                                 "can_talk": False,
                             })
-                            time.sleep(0.25)
+
+                            goal_started = robot.goto_map(goal["x"], goal["y"], goal.get("yaw", 0.0))
+                            if not goal_started:
+                                last_route_error = f"route {route_idx} could not start"
+                                if command_generation != current_operation_generation():
+                                    interrupted = True
+                                    break
+                                print(f"[NAV ROUTE] {last_route_error}; trying next approach", flush=True)
+                                continue
+                            started_routes += 1
+
+                            t_start = time.time()
+                            last_progress = time.time()
+                            best_route_d = None
+                            route_reached = False
+
+                            while time.time() - t_start < nav_timeout:
+                                if command_generation != current_operation_generation():
+                                    interrupted = True
+                                    break
+
+                                d_target = robot.distance_to(saved_place["x"], saved_place["y"])
+                                d_goal = robot.distance_to(goal["x"], goal["y"])
+                                distance_msg = f"Navigating to {target} via route {route_idx}/{route_total}"
+                                if d_target is not None:
+                                    distance_msg = f"Distance to {target}: {d_target:.2f} m"
+                                    if d_target <= arrival_radius:
+                                        arrived = True
+                                        break
+
+                                if d_goal is not None:
+                                    progress_d = d_goal
+                                    if d_goal <= goal_radius:
+                                        if goal.get("kind") != "saved" and (d_target is None or d_target <= approach_radius):
+                                            arrived = True
+                                            reached_approach = True
+                                            break
+                                        if goal.get("kind") == "saved":
+                                            arrived = True
+                                            break
+                                        route_reached = True
+                                        last_route_error = f"route {route_idx} reached but was not close enough to {target}"
+                                        break
+                                else:
+                                    progress_d = d_target
+
+                                if progress_d is not None:
+                                    if best_route_d is None or progress_d < best_route_d - progress_thresh:
+                                        best_route_d = progress_d
+                                        last_progress = time.time()
+                                    elif (
+                                        time.time() - t_start >= start_grace
+                                        and time.time() - last_progress > stuck_timeout
+                                    ):
+                                        last_route_error = f"route {route_idx} made no progress"
+                                        print(f"[NAV ROUTE] {last_route_error}; trying next approach", flush=True)
+                                        break
+                                else:
+                                    last_progress = time.time()
+
+                                face.send_status({
+                                    "mode": "searching",
+                                    "target": target,
+                                    "phase": "navigating",
+                                    "waypoint_index": route_idx,
+                                    "waypoint_total": route_total,
+                                    "searched_count": max(0, route_idx - 1),
+                                    "found": False,
+                                    "message": distance_msg,
+                                    "objects": objects[:4],
+                                    "can_talk": False,
+                                })
+                                time.sleep(0.25)
+                            else:
+                                last_route_error = f"route {route_idx} timed out"
+
+                            if interrupted or arrived:
+                                break
+
+                            robot.cancel_navigation()
+                            robot.stop()
+                            robot.clear_navigation_goal()
+                            if route_reached:
+                                print(f"[NAV ROUTE] {last_route_error}; trying next approach", flush=True)
                     finally:
                         if hasattr(perceptions, "set_moving"):
                             perceptions.set_moving(False)
@@ -1091,23 +1218,32 @@ def main():
                         phase = "cancelled"
                         found = False
                     elif arrived:
-                        speech = f"I have successfully arrived at {target}."
+                        if reached_approach:
+                            speech = f"I reached a safe approach near {target}."
+                        else:
+                            speech = f"I have successfully arrived at {target}."
                         phase = "found"
                         found = True
                     else:
-                        speech = f"I failed to navigate to {target}."
+                        if started_routes == 0:
+                            speech = f"I could not start any route to {target}."
+                        else:
+                            speech = (
+                                f"I could not find a reachable path to {target} "
+                                f"after trying {attempted_routes} route{'s' if attempted_routes != 1 else ''}."
+                            )
                         phase = "not_found"
                         found = False
 
-                    print(f"[TASK RESULT]: arrived={arrived} speech={speech}", flush=True)
+                    print(f"[TASK RESULT]: arrived={arrived} speech={speech} detail={last_route_error}", flush=True)
                     deliver_response(
                         perceptions, face, mobile_gateway, envelope, command, speech,
                         status="cancelled" if interrupted else ("completed" if arrived else "failed"),
                         arrived=arrived,
                     )
                     face_show_search(
-                        face, target, phase, 1, 1, objects,
-                        found=found, searched_count=1, message=speech, can_talk=True
+                        face, target, phase, max(1, attempted_routes), max(1, route_total), objects,
+                        found=found, searched_count=attempted_routes, message=speech, can_talk=True
                     )
                     continue
 

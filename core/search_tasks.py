@@ -659,7 +659,7 @@ class MapSearchTask:
                 force=True
             )
 
-            goal_started = self.robot.goto_map(wp["x"], wp["y"])
+            goal_started = self.robot.goto_map(wp["x"], wp["y"], wp.get("yaw", 0.0))
             if not goal_started:
                 consecutive_nav_failures += 1
                 self._mark_visited(wp, scanned=False, note="navigation-failed")
@@ -713,7 +713,7 @@ class MapSearchTask:
                         print("[SEARCH] live hit was not confirmed; resuming waypoint", flush=True)
                         if self.is_cancel_requested():
                             return self._cancelled_result(target_text)
-                        goal_started = self.robot.goto_map(wp["x"], wp["y"])
+                        goal_started = self.robot.goto_map(wp["x"], wp["y"], wp.get("yaw", 0.0))
                         if not goal_started:
                             break
                         if hasattr(self.perceptions, "set_moving"):
